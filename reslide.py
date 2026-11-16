@@ -3,11 +3,14 @@
 
 使い方: python reslide.py <対象.pptx> [--config 設定.json] [--out レポート.md]
        python reslide.py <対象.pptx> --fix   … 自動調整（フェーズ2）
+       python reslide.py <対象.pptx> --split … 分割候補の判定だけをレポートする（フェーズ3）
+       python reslide.py <対象.pptx> --fix --split … 自動調整に加えてページ分割も行う
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
 --fix の結果は <元名>_reslide.pptx へ新規保存し、変更一覧を Markdown で出す。
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -793,10 +796,13 @@ def build_changes_report(path, out_name, changes):
     n_size = sum(1 for c in changes if c["type"] == "サイズ")
     n_move = sum(1 for c in changes if c["type"].startswith("移動"))
     n_fail = sum(1 for c in changes if c["type"] == "未解消")
+    n_split = sum(1 for c in changes if c["type"] == "分割")
     L.append(
         "- 変更の合計: %d件（サイズ %d件 / 移動 %d件 / 解消できなかった %d件）"
         % (len(changes), n_size, n_move, n_fail)
     )
+    if n_split:
+        L.append("- うちページ分割: %d件" % n_split)
     if not changes:
         L.append("")
         L.append("変更なし")
@@ -821,8 +827,263 @@ def build_changes_report(path, out_name, changes):
     return "\n".join(L) + "\n"
 
 
+# ---------------------------------------------------------------- ページ分割（フェーズ3）
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+R_ATTR_PREFIX = "{%s}" % R_NS  # r:embed / r:id など、リレーションシップ参照の属性
+
+# 分割で要素ごと移せる種類（内部は分割しない）
+SPLIT_MOVABLE_KINDS = ("表", "グラフ", "SmartArt")
+
+
+def _text_overlap_pairs(elems, cfg):
+    """テキストを持つ要素同士の重なりペア数。
+
+    物差しは判定（judge）の重なりと同じ設定（overlap_min_mm / overlap_min_ratio）。
+    判定側の指摘には図との組み合わせも含まれるため、ここでは数え直す。
+    """
+    cand = [e for e in elems if e.has_text]
+    pairs = 0
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            a, b = cand[i], cand[j]
+            ix = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+            iy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+            if ix <= 0 or iy <= 0:
+                continue
+            if mm(ix) < cfg["overlap_min_mm"] or mm(iy) < cfg["overlap_min_mm"]:
+                continue
+            small = min(a.w * a.h, b.w * b.h) or 1
+            if ix * iy / small >= cfg["overlap_min_ratio"]:
+                pairs += 1
+    return pairs
+
+
+def judge_split(slides, cfg):
+    """スライドごとの詰め込み判定。実測値と候補かどうかを返す。
+
+    候補になるのは、テキスト要素数・総文字数・テキスト同士の重なりの
+    3つすべてが設定のしきい値以上のスライドだけ。要素数だけ多い図の
+    ラベルだらけのスライドや、タイトルだけのスライドは対象にならない。
+    """
+    verdicts = []
+    for sno, elems in enumerate(slides, 1):
+        n_text = sum(1 for e in elems if e.has_text)
+        chars = sum(len(u.text) for e in elems for u in e.units)
+        pairs = _text_overlap_pairs(elems, cfg)
+        verdicts.append(
+            {
+                "slide": sno,
+                "text_elements": n_text,
+                "chars": chars,
+                "overlaps": pairs,
+                "candidate": n_text >= cfg["split_min_text_elements"]
+                and chars >= cfg["split_min_chars"]
+                and pairs >= cfg["split_min_overlaps"],
+            }
+        )
+    return verdicts
+
+
+def _split_reason(v, cfg):
+    """詰め込み判定の根拠（実測値としきい値の照合）を1行で返す。"""
+    return (
+        "テキスト要素 %d（しきい値 %d以上）/ 総文字数 %d（しきい値 %d以上）"
+        "/ テキスト同士の重なり %d件（しきい値 %d件以上）→ %s"
+        % (
+            v["text_elements"],
+            cfg["split_min_text_elements"],
+            v["chars"],
+            cfg["split_min_chars"],
+            v["overlaps"],
+            cfg["split_min_overlaps"],
+            "分割候補" if v["candidate"] else "対象外",
+        )
+    )
+
+
+def _max_size(e):
+    """要素内の解決済みフォントサイズの最大値（実効値）。無ければ None。"""
+    sizes = [
+        size * u.scale
+        for u in e.units
+        for p in u.paragraphs
+        for (n, size, src) in p["runs"]
+        if size is not None
+    ]
+    return max(sizes) if sizes else None
+
+
+def _split_heading(elems, cfg):
+    """見出しに当たる要素。タイトル用プレースホルダを優先し、
+    無ければ解決済みサイズが最大のテキスト要素を当てる。"""
+    for e in elems:
+        if e.has_text and e.ph_type in cfg["title_placeholder_types"]:
+            return e
+    best = None
+    for e in elems:
+        if not e.has_text:
+            continue
+        s = _max_size(e)
+        if s is not None and (best is None or s > _max_size(best)):
+            best = e
+    return best
+
+
+def _is_note_only(e, cfg):
+    """テキストの役割がすべて注記（出典・ページ番号など）の要素か。
+
+    注記はスライドの付属物として元のスライドに残す
+    （フェーズ2で注記のサイズを触らないのと同じ扱い）。
+    """
+    seen = False
+    for u in e.units:
+        if not u.text.strip():
+            continue
+        seen = True
+        role, _why = classify(e, u, cfg)
+        if role != "note":
+            return False
+    return seen
+
+
+def _split_movable(elems, heading, cfg):
+    """分割で後半へ移す要素。読み順（上から、左から）に並べて返す。
+
+    対象はスライド直下の要素だけ。グループ内の要素は親のグループごとで
+    なければ移せないため対象にしない。画像は元のスライドに残し、
+    表・グラフ・SmartArt は内部を割らず要素ごと移す。
+    """
+    out = []
+    for e in elems:
+        if e is heading or e.shape is None or e.in_group:
+            continue
+        if not (e.has_text or e.kind in SPLIT_MOVABLE_KINDS):
+            continue
+        if _is_note_only(e, cfg):
+            continue
+        out.append(e)
+    out.sort(key=lambda e: (e.y, e.x))
+    return out
+
+
+def _retarget_rels(src_part, dst_part, element):
+    """移した要素のリレーションシップ参照を、移し先のスライド側へ張り替える。
+
+    画像やグラフ部品は r:embed / r:id 等の属性で部品を指している。要素の
+    XML だけを別のスライドへ移すと参照が元のスライド側に残るため、同じ
+    参照先へのリレーションシップを移し先にも作り、属性値を差し替える。
+    """
+    for el in element.iter():
+        for attr in list(el.attrib):
+            if not attr.startswith(R_ATTR_PREFIX):
+                continue
+            rid = el.get(attr)
+            if not rid or rid not in src_part.rels:
+                continue
+            rel = src_part.rels[rid]
+            if rel.is_external:
+                new_rid = dst_part.relate_to(
+                    rel.target_ref, rel.reltype, is_external=True
+                )
+            else:
+                new_rid = dst_part.relate_to(rel.target_part, rel.reltype)
+            el.set(attr, new_rid)
+
+
+def _insert_slide_after(prs, src_slide):
+    """src_slide の直後に、同じレイアウトの空スライドを挿入して返す。
+
+    python-pptx には挿入位置を指定する API が無いため、末尾へ追加したうえで
+    presentation の sldIdLst の並びを入れ替える。スライドの表示順は
+    sldIdLst の順序で決まるため、これで直後の位置に置ける。
+    """
+    new_slide = prs.slides.add_slide(src_slide.slide_layout)
+    # レイアウト由来のプレースホルダは中身が無いので取り除く
+    for shp in list(new_slide.shapes):
+        sp = shp._element
+        sp.getparent().remove(sp)
+    sldIdLst = prs.part._element.find("p:sldIdLst", NS)
+    r_id = R_ATTR_PREFIX + "id"
+    src_id = None
+    for sldId in sldIdLst:
+        if prs.part.rels[sldId.get(r_id)].target_part is src_slide.part:
+            src_id = sldId
+    if src_id is None:
+        raise ValueError("元のスライドの sldId が見つかりません")
+    new_id = sldIdLst[-1]  # add_slide で末尾に付いた分
+    sldIdLst.remove(new_id)
+    sldIdLst.insert(list(sldIdLst).index(src_id) + 1, new_id)
+    return new_slide
+
+
+def apply_splits(prs, slide_objs, slides, verdicts, cfg):
+    """分割候補のスライドを2枚に分ける。変更の一覧を返す。
+
+    slide_objs は分割前の prs.slides の並び（slides と対応）。
+    元の番号がずれないよう、後ろのスライドから処理する。
+    見出しは元のスライドに残したうえで複製を新しいスライドにも置き、
+    後半の要素は元の位置のまま新しいスライドへ移す。
+    """
+    changes = []
+
+    def rec(sno, type_, head, detail):
+        changes.append(
+            {
+                "slide": sno,
+                "type": type_,
+                "elem": "（スライド全体）",
+                "label": "",
+                "head": head[:24].replace("\n", " "),
+                "detail": detail,
+            }
+        )
+
+    targets = [v for v in verdicts if v["candidate"]]
+    for v in sorted(targets, key=lambda v: -v["slide"]):
+        sno = v["slide"]
+        elems = slides[sno - 1]
+        src_slide = slide_objs[sno - 1]
+        heading = _split_heading(elems, cfg)
+        movable = _split_movable(elems, heading, cfg)
+        reason = _split_reason(v, cfg)
+        head = heading.text if heading is not None else ""
+        if len(movable) < 2:
+            rec(
+                sno,
+                "未解消",
+                head,
+                "分割候補だが、移せる要素が %d個しかないため分割しなかった。判定根拠: %s"
+                % (len(movable), reason),
+            )
+            continue
+        to_move = movable[len(movable) // 2 :]
+        new_slide = _insert_slide_after(prs, src_slide)
+        if heading is not None:
+            dup = copy.deepcopy(heading.shape._element)
+            _retarget_rels(src_slide.part, new_slide.part, dup)
+            new_slide.shapes._spTree.append(dup)
+        for e in to_move:
+            el = e.shape._element
+            _retarget_rels(src_slide.part, new_slide.part, el)
+            new_slide.shapes._spTree.append(el)
+        heading_note = (
+            "見出し「%s」は元のスライドと新しいスライドの両方に置いた。"
+            % head[:16].replace("\n", " ")
+            if heading is not None
+            else ""
+        )
+        rec(
+            sno,
+            "分割",
+            head,
+            "元のスライド%dを2枚に分け、後半の%d要素を直後の新しいスライドへ移した。%s判定根拠: %s"
+            % (sno, len(to_move), heading_note, reason),
+        )
+    return changes
+
+
 # ---------------------------------------------------------------- レポート
-def build_report(path, prs, slides, findings, stats, cfg):
+def build_report(path, prs, slides, findings, stats, cfg, split_verdicts=None):
     L = []
     L.append("# ReSlide レポート: %s" % Path(path).name)
     L.append("")
@@ -913,6 +1174,20 @@ def build_report(path, prs, slides, findings, stats, cfg):
                 why,
             )
         )
+    if split_verdicts is not None:
+        L.append("")
+        L.append("## ページ分割の候補（--split の判定）")
+        L.append("")
+        L.append(
+            "- 候補の条件: テキスト要素 %d個以上 / 総文字数 %d以上 / テキスト同士の重なり %d件以上（3条件すべて）"
+            % (
+                cfg["split_min_text_elements"],
+                cfg["split_min_chars"],
+                cfg["split_min_overlaps"],
+            )
+        )
+        for v in split_verdicts:
+            L.append("- スライド%d: %s" % (v["slide"], _split_reason(v, cfg)))
     L.append("")
     L.append("## 対象外・前提")
     L.append("")
@@ -937,7 +1212,7 @@ def sha256(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="pptx の見やすさ問題をレポートする（--fix で自動調整も行う）"
+        description="pptx の見やすさ問題をレポートする（--fix で自動調整、--split でページ分割も行う）"
     )
     ap.add_argument("pptx")
     ap.add_argument(
@@ -953,6 +1228,11 @@ def main(argv=None):
         action="store_true",
         help="自動調整して <元名>_reslide.pptx を新規保存し、変更一覧を出す",
     )
+    ap.add_argument(
+        "--split",
+        action="store_true",
+        help="詰め込みスライドの分割候補を判定する（--fix と併用すると分割も実行する）",
+    )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
         try:
@@ -965,8 +1245,13 @@ def main(argv=None):
     prs = Presentation(str(src))
     resolver = Resolver(prs)
     slides = read_presentation(prs, resolver)
+    # 分割の判定は、調整で位置やサイズが変わる前の状態に対して行う
+    verdicts = judge_split(slides, cfg) if args.split else None
     if args.fix:
+        slide_objs = list(prs.slides)
         changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
+        if args.split:
+            changes += apply_splits(prs, slide_objs, slides, verdicts, cfg)
         out_pptx = Path.cwd() / (src.stem + "_reslide.pptx")
         prs.save(str(out_pptx))
         report = build_changes_report(src, out_pptx.name, changes)
@@ -981,7 +1266,7 @@ def main(argv=None):
         print("変更一覧の保存先: %s" % out.resolve())
     else:
         findings, stats = judge(slides, cfg, prs.slide_width, prs.slide_height)
-        report = build_report(src, prs, slides, findings, stats, cfg)
+        report = build_report(src, prs, slides, findings, stats, cfg, verdicts)
         out = (
             Path(args.out)
             if args.out
