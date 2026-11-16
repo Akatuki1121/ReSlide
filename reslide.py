@@ -395,6 +395,23 @@ def classify(elem, unit, cfg):
 ROLE_JP = {"body": "本文", "label": "ラベル"}
 
 
+def _weighted_median(pairs):
+    """(サイズ, 文字数) の組から、文字数で重み付けした中央値を返す。無ければ None。
+
+    本文の中央値は文字数で重み付ける。短いセル1つ分の文字と長文の本文を
+    同じ重さで数えると、表のあるスライドで中央値が実態より小さく出るため。
+    """
+    total = sum(n for _size, n in pairs)
+    if not total:
+        return None
+    acc = 0
+    for size, n in sorted(pairs):
+        acc += n
+        if acc >= total / 2:
+            return size
+    return None
+
+
 def judge(slides, cfg, slide_w, slide_h):
     findings = {i: [] for i in range(1, len(slides) + 1)}
     stats = {
@@ -407,8 +424,11 @@ def judge(slides, cfg, slide_w, slide_h):
         "units": 0,
     }
     floors = {"body": cfg["body_min_pt"], "label": cfg.get("label_min_pt", 18)}
+    body_pairs_all = []  # 資料全体の本文の (サイズ, 文字数)。全体の中央値用
 
     for sno, elems in enumerate(slides, 1):
+        body_units = []  # このスライドの本文ユニット (要素, ユニット, 最小サイズ, 根拠)
+        body_pairs = []  # このスライドの本文の (サイズ, 文字数)。中央値用
         for e in elems:
             for u in e.units:
                 if not u.text.strip():
@@ -431,8 +451,12 @@ def judge(slides, cfg, slide_w, slide_h):
                         eff = size * u.scale
                         stats["by_src"][src] = stats["by_src"].get(src, 0) + n
                         sizes.append(eff)
+                        if role == "body":
+                            body_pairs.append((eff, n))
                         if floor_u is not None and eff < floor_u:
                             small_chars += n
+                if role == "body" and sizes:
+                    body_units.append((e, u, min(sizes), why))
                 if role == "note":
                     stats["notes"].append(
                         (
@@ -480,6 +504,34 @@ def judge(slides, cfg, slide_w, slide_h):
                             ),
                         }
                     )
+
+        # 周囲とのバランス（相対判定）: そのスライドの本文の中央値と比べて
+        # 小さい文字を出す。絶対値の下限で既に指摘した文字と重ねないため、
+        # 対象は下限を満たしている本文だけにする
+        body_pairs_all.extend(body_pairs)
+        if len(body_units) >= cfg.get("relative_min_body_units", 3):
+            med = _weighted_median(body_pairs)
+            ratio = cfg.get("relative_min_ratio", 0.7)
+            if med is not None:
+                for e, u, unit_min, why in body_units:
+                    if floors["body"] <= unit_min < med * ratio:
+                        findings[sno].append(
+                            {
+                                "type": "周囲より小さい",
+                                "elem": e,
+                                "label": u.label,
+                                "head": u.text[:24].replace("\n", " "),
+                                "detail": "最小 %.1fpt は、スライドの本文の中央値 %.1fpt の %.0f%% で、しきい値（中央値の%.0f%%）を下回る。絶対値の下限 %gpt は満たしている。役割=本文（%s）"
+                                % (
+                                    unit_min,
+                                    med,
+                                    unit_min / med * 100,
+                                    ratio * 100,
+                                    floors["body"],
+                                    why,
+                                ),
+                            }
+                        )
 
         # はみ出し（許容は要素種別で分ける: 画像は広く、それ以外は従来通り）
         for e in elems:
@@ -559,6 +611,7 @@ def judge(slides, cfg, slide_w, slide_h):
                         ),
                     }
                 )
+    stats["body_median_all"] = _weighted_median(body_pairs_all)
     return findings, stats
 
 
@@ -677,7 +730,15 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
         )
 
     floors = {"body": cfg["body_min_pt"], "label": cfg.get("label_min_pt", 18)}
+    margin = cfg.get("heading_margin_pt", 2)
     for sno, elems in enumerate(slides, 1):
+        # 階層の保護: 見出しのサイズからマージンを引いた値を、本文を拡大する
+        # ときの上限にする。見出しの決め方は分割・並び替えと同じ _split_heading
+        # に揃え、上限は拡大前のスライドの状態から決める
+        heading = _split_heading(elems, cfg)
+        heading_size = _max_size(heading) if heading is not None else None
+        cap = heading_size - margin if heading_size is not None else None
+
         # 1. サイズの拡大（note と title は触らない）
         for e in elems:
             for u in e.units:
@@ -687,25 +748,45 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
                 floor = floors.get(role)
                 if floor is None:
                     continue
-                target = _fit_size(u, floor)
-                if target is None:
-                    continue
-                old_min = min(
+                sizes = [
                     size * u.scale
                     for p in u.paragraphs
                     for (n, size, s2) in p["runs"]
                     if size is not None
-                )
+                ]
+                if not sizes:
+                    continue
+                cur_min = min(sizes)
+                if cur_min >= floor:
+                    continue
+                desired = floor
+                if role == "body" and cap is not None and e is not heading:
+                    desired = min(floor, cap)
+                    if desired <= cur_min:
+                        rec(
+                            sno,
+                            "未解消",
+                            e,
+                            u.label,
+                            "見出し（%.1fpt）との大きさの順序を保つため、拡大の上限は %.1fpt（見出し − マージン %gpt）となり、現在の最小 %.1fpt 以下になるため拡大しなかった。役割=本文（%s）"
+                            % (heading_size, cap, margin, cur_min, why),
+                            head=u.text,
+                        )
+                        continue
+                target = _fit_size(u, desired)
+                if target is None:
+                    continue
                 _apply_size(u, target)
-                rec(
-                    sno,
-                    "サイズ",
-                    e,
-                    u.label,
+                detail = (
                     "最小 %.1fpt → %.1fpt（役割=%s、下限 %gpt。枠に収まる範囲で拡大）"
-                    % (old_min, target, ROLE_JP[role], floor),
-                    head=u.text,
+                    % (cur_min, target, ROLE_JP[role], floor)
                 )
+                if desired < floor:
+                    detail += (
+                        "。見出し（%.1fpt）との順序を保つため、上限 %.1fpt に抑えた"
+                        % (heading_size, cap)
+                    )
+                rec(sno, "サイズ", e, u.label, detail, head=u.text)
 
         # 2. はみ出しの解消（スライド範囲内へ平行移動で戻す）
         for e in elems:
@@ -1344,6 +1425,15 @@ def build_report(
     )
     total = sum(len(v) for v in findings.values())
     L.append("- 指摘の合計: %d 件" % total)
+    body_median_all = stats.get("body_median_all")
+    if body_median_all is not None and body_median_all < cfg["body_min_pt"]:
+        L.append("")
+        L.append("## 資料全体の文字の小ささ")
+        L.append("")
+        L.append(
+            "- 資料全体の文字が小さめです（本文の中央値 %.1fpt / 本文の下限 %gpt）。個々の文字への指摘とは別枠の通知で、指摘の合計には数えていません"
+            % (body_median_all, cfg["body_min_pt"])
+        )
     L.append("")
     L.append("## フォントサイズの解決状況")
     L.append("")
