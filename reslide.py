@@ -655,18 +655,21 @@ def _est_height_mm(unit, raise_to):
     return total
 
 
-def _fit_size(unit, floor):
-    """floor 以下で枠に収まる最大のサイズ(pt)。現状の最小サイズ以下なら None。"""
+def _min_size(unit):
+    """ユニット内の解決済みフォントサイズの最小値（実効値）。無ければ None。"""
     sizes = [
         size * unit.scale
         for p in unit.paragraphs
         for (n, size, src) in p["runs"]
         if size is not None
     ]
-    if not sizes:
-        return None
-    cur_min = min(sizes)
-    if cur_min >= floor:
+    return min(sizes) if sizes else None
+
+
+def _fit_size(unit, floor):
+    """floor 以下で枠に収まる最大のサイズ(pt)。現状の最小サイズ以下なら None。"""
+    cur_min = _min_size(unit)
+    if cur_min is None or cur_min >= floor:
         return None
     inner_h = mm(unit.inner_h) * FIT_SAFETY
     cand = float(floor)
@@ -690,6 +693,58 @@ def _apply_size(unit, target_eff):
                     rpr = el.makeelement(A + "rPr", {})
                     el.insert(0, rpr)
                 rpr.set("sz", str(int(round(raw * 100))))
+
+
+def _needed_heading_size(elems, heading, heading_size, cap, cfg):
+    """本文の拡大目標が上限を超える場合に、見出しに必要な大きさ(pt)を返す。
+
+    対象が無ければ None。本文ごとに「拡大目標 + マージン」と「元の比率を
+    保つ大きさ（拡大目標 × 見出しサイズ ÷ 本文の現在の最小サイズ）」の
+    大きい方を必要値とし、スライド内ではその最大値を採る。拡大目標は
+    下限と枠に収まる範囲で決まる大きさ（_fit_size の結果）で、枠の都合で
+    そもそも拡大できない本文は対象にしない。
+    """
+    margin = cfg.get("heading_margin_pt", 2)
+    floor = cfg["body_min_pt"]
+    needed = None
+    for e in elems:
+        if e is heading:
+            continue
+        for u in e.units:
+            if not u.text.strip():
+                continue
+            role, _why = classify(e, u, cfg)
+            if role != "body":
+                continue
+            cur_min = _min_size(u)
+            if cur_min is None or cur_min >= floor:
+                continue
+            target = _fit_size(u, floor)
+            if target is None or target <= cap:
+                continue
+            cand = max(target + margin, target * heading_size / cur_min)
+            needed = cand if needed is None else max(needed, cand)
+    return needed
+
+
+def _raise_heading(heading, cur_size, needed):
+    """見出しを needed(pt) まで、枠に収まる範囲で上げる。上げた後の大きさを返す。
+
+    収まりの推定は本文の拡大と同じ _est_height_mm を使い、needed から
+    0.5pt 刻みで下げて、現在の大きさより大きく収まる最大の大きさを探す。
+    現在の大きさ以下しか収まらない場合は上げず、None を返す。
+    """
+    units = [u for u in heading.units if u.text.strip()]
+    if not units:
+        return None
+    cand = float(needed)
+    while cand > cur_size:
+        if all(_est_height_mm(u, cand) <= mm(u.inner_h) * FIT_SAFETY for u in units):
+            for u in units:
+                _apply_size(u, cand)
+            return cand
+        cand -= 0.5
+    return None
 
 
 def _move(e, dx, dy):
@@ -734,10 +789,34 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
     for sno, elems in enumerate(slides, 1):
         # 階層の保護: 見出しのサイズからマージンを引いた値を、本文を拡大する
         # ときの上限にする。見出しの決め方は分割・並び替えと同じ _split_heading
-        # に揃え、上限は拡大前のスライドの状態から決める
+        # に揃える
         heading = _split_heading(elems, cfg)
         heading_size = _max_size(heading) if heading is not None else None
         cap = heading_size - margin if heading_size is not None else None
+
+        # 見出し側を上げる調整: 本文の拡大目標が上限を超えるスライドでは、
+        # 本文を上限で止める前に、見出しを必要な大きさまで上げて上限自体を
+        # 引き上げる。見出しが上がった場合は、上限は上がった後の大きさで
+        # 計算し直し、従来の階層の保護をそのまま適用する
+        if heading is not None and heading_size is not None:
+            needed = _needed_heading_size(elems, heading, heading_size, cap, cfg)
+            if needed is not None:
+                raised = _raise_heading(heading, heading_size, needed)
+                if raised is not None:
+                    detail = (
+                        "見出し %.1fpt → %.1fpt（本文を下限 %gpt まで上げるため、"
+                        "見出しと本文の大きさの順序と元の比率を保つのに必要な大きさへ拡大）"
+                        % (heading_size, raised, floors["body"])
+                    )
+                    if raised < needed:
+                        detail += (
+                            "。必要な大きさ %.1fpt までは枠に収まらないため、"
+                            "収まる最大に留めた" % needed
+                        )
+                    label = next((u.label for u in heading.units if u.text.strip()), "")
+                    rec(sno, "サイズ", heading, label, detail)
+                    heading_size = raised
+                    cap = heading_size - margin
 
         # 1. サイズの拡大（note と title は触らない）
         for e in elems:
@@ -748,15 +827,9 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
                 floor = floors.get(role)
                 if floor is None:
                     continue
-                sizes = [
-                    size * u.scale
-                    for p in u.paragraphs
-                    for (n, size, s2) in p["runs"]
-                    if size is not None
-                ]
-                if not sizes:
+                cur_min = _min_size(u)
+                if cur_min is None:
                     continue
-                cur_min = min(sizes)
                 if cur_min >= floor:
                     continue
                 desired = floor
