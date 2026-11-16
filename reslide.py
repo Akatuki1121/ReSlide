@@ -4,6 +4,7 @@
 使い方: python reslide.py <対象.pptx> [--config 設定.json] [--out レポート.md]
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
 """
+
 import argparse
 import hashlib
 import json
@@ -11,7 +12,6 @@ import re
 import sys
 from pathlib import Path
 
-from lxml import etree
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 
@@ -64,9 +64,17 @@ class Resolver:
         if shape is None or not shape.is_placeholder:
             return "other"
         t = shape.placeholder_format.type
-        if t in (PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.VERTICAL_TITLE):
+        if t in (
+            PP_PLACEHOLDER.TITLE,
+            PP_PLACEHOLDER.CENTER_TITLE,
+            PP_PLACEHOLDER.VERTICAL_TITLE,
+        ):
             return "title"
-        if t in (PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.DATE):
+        if t in (
+            PP_PLACEHOLDER.SLIDE_NUMBER,
+            PP_PLACEHOLDER.FOOTER,
+            PP_PLACEHOLDER.DATE,
+        ):
             return "other"
         return "body"
 
@@ -140,7 +148,14 @@ class Resolver:
         try:
             master = shape.part.slide.slide_layout.slide_master
             tx = master._element.find("p:txStyles", NS)
-            style = tx.find({"title": "p:titleStyle", "body": "p:bodyStyle", "other": "p:otherStyle"}[kind], NS)
+            style = tx.find(
+                {
+                    "title": "p:titleStyle",
+                    "body": "p:bodyStyle",
+                    "other": "p:otherStyle",
+                }[kind],
+                NS,
+            )
             s = _sz(_lvl_defrpr(style, lvl))
             if s:
                 return s, SRC_MASTER
@@ -281,9 +296,15 @@ def walk(resolver, slide_no, shapes, tf, out, in_group=False):
                         continue
                     tb = cell._tc.find("a:txBody", NS)
                     if tb is not None:
-                        el.units.append(read_text_unit(resolver, sh, tb, "セル(%d行%d列)" % (ri + 1, ci + 1)))
+                        el.units.append(
+                            read_text_unit(
+                                resolver, sh, tb, "セル(%d行%d列)" % (ri + 1, ci + 1)
+                            )
+                        )
         elif sh.has_text_frame:
-            el.units.append(read_text_unit(resolver, sh, sh._element.find("p:txBody", NS)))
+            el.units.append(
+                read_text_unit(resolver, sh, sh._element.find("p:txBody", NS))
+            )
         out.append(el)
 
 
@@ -314,7 +335,14 @@ def classify(elem, unit, cfg):
 
 def judge(slides, cfg, slide_w, slide_h):
     findings = {i: [] for i in range(1, len(slides) + 1)}
-    stats = {"chars_total": 0, "chars_unresolved": 0, "unresolved": [], "by_src": {}, "notes": [], "units": 0}
+    stats = {
+        "chars_total": 0,
+        "chars_unresolved": 0,
+        "unresolved": [],
+        "by_src": {},
+        "notes": [],
+        "units": 0,
+    }
     floor = cfg["body_min_pt"]
     tol = cfg["out_of_bounds_tolerance_mm"] * EMU_PER_MM
 
@@ -333,7 +361,9 @@ def judge(slides, cfg, slide_w, slide_h):
                         stats["chars_total"] += n
                         if size is None:
                             stats["chars_unresolved"] += n
-                            stats["unresolved"].append((sno, e.name, u.label, p["text"][:20]))
+                            stats["unresolved"].append(
+                                (sno, e.name, u.label, p["text"][:20])
+                            )
                             continue
                         eff = size * u.scale
                         stats["by_src"][src] = stats["by_src"].get(src, 0) + n
@@ -341,35 +371,73 @@ def judge(slides, cfg, slide_w, slide_h):
                         if role == "body" and eff < floor:
                             small_chars += n
                 if role == "note":
-                    stats["notes"].append((sno, e.name, u.label, why, min(sizes) if sizes else None, u.text[:20]))
+                    stats["notes"].append(
+                        (
+                            sno,
+                            e.name,
+                            u.label,
+                            why,
+                            min(sizes) if sizes else None,
+                            u.text[:20],
+                        )
+                    )
                 if role == "body" and small_chars:
-                    scale_note = "（自動縮小 %d%% 適用後の値）" % round(u.scale * 100) if u.scale != 1.0 else ""
-                    findings[sno].append({
-                        "type": "小さい文字",
-                        "elem": e, "label": u.label,
-                        "head": u.text[:24].replace("\n", " "),
-                        "detail": "最小 %.1fpt / 本文の下限 %gpt（%d/%d文字が下限未満）%s。役割=本文（%s）"
-                                  % (min(sizes), floor, small_chars, total, scale_note, why),
-                    })
+                    scale_note = (
+                        "（自動縮小 %d%% 適用後の値）" % round(u.scale * 100)
+                        if u.scale != 1.0
+                        else ""
+                    )
+                    findings[sno].append(
+                        {
+                            "type": "小さい文字",
+                            "elem": e,
+                            "label": u.label,
+                            "head": u.text[:24].replace("\n", " "),
+                            "detail": "最小 %.1fpt / 本文の下限 %gpt（%d/%d文字が下限未満）%s。役割=本文（%s）"
+                            % (min(sizes), floor, small_chars, total, scale_note, why),
+                        }
+                    )
 
         # はみ出し
         for e in elems:
             if e.kind == "線・コネクタ":
                 continue
             over = []
-            if e.x < -tol: over.append("左 %.1fmm" % mm(-e.x))
-            if e.y < -tol: over.append("上 %.1fmm" % mm(-e.y))
-            if e.x + e.w > slide_w + tol: over.append("右 %.1fmm" % mm(e.x + e.w - slide_w))
-            if e.y + e.h > slide_h + tol: over.append("下 %.1fmm" % mm(e.y + e.h - slide_h))
+            if e.x < -tol:
+                over.append("左 %.1fmm" % mm(-e.x))
+            if e.y < -tol:
+                over.append("上 %.1fmm" % mm(-e.y))
+            if e.x + e.w > slide_w + tol:
+                over.append("右 %.1fmm" % mm(e.x + e.w - slide_w))
+            if e.y + e.h > slide_h + tol:
+                over.append("下 %.1fmm" % mm(e.y + e.h - slide_h))
             if over:
-                findings[sno].append({
-                    "type": "はみ出し", "elem": e, "label": "", "head": (e.text or e.name)[:24].replace("\n", " "),
-                    "detail": "スライド範囲 %.0fx%.0fmm に対し、位置(%.1f, %.1f) 大きさ %.1fx%.1fmm。はみ出し: %s"
-                              % (mm(slide_w), mm(slide_h), mm(e.x), mm(e.y), mm(e.w), mm(e.h), "、".join(over)),
-                })
+                findings[sno].append(
+                    {
+                        "type": "はみ出し",
+                        "elem": e,
+                        "label": "",
+                        "head": (e.text or e.name)[:24].replace("\n", " "),
+                        "detail": "スライド範囲 %.0fx%.0fmm に対し、位置(%.1f, %.1f) 大きさ %.1fx%.1fmm。はみ出し: %s"
+                        % (
+                            mm(slide_w),
+                            mm(slide_h),
+                            mm(e.x),
+                            mm(e.y),
+                            mm(e.w),
+                            mm(e.h),
+                            "、".join(over),
+                        ),
+                    }
+                )
 
         # 重なり
-        cand = [e for e in elems if e.kind != "線・コネクタ" and (e.has_text or e.kind in ("図(画像)", "表", "グラフ", "SmartArt"))]
+        cand = [
+            e
+            for e in elems
+            if e.kind != "線・コネクタ"
+            and (e.has_text or e.kind in ("図(画像)", "表", "グラフ", "SmartArt"))
+        ]
         for i in range(len(cand)):
             for j in range(i + 1, len(cand)):
                 a, b = cand[i], cand[j]
@@ -383,13 +451,24 @@ def judge(slides, cfg, slide_w, slide_h):
                 ratio = ix * iy / small
                 if ratio < cfg["overlap_min_ratio"]:
                     continue
-                findings[sno].append({
-                    "type": "重なり", "elem": a, "label": "", "head": (a.text or a.name)[:24].replace("\n", " "),
-                    "detail": "「%s」(%s) と「%s」(%s) が重なる。重なり %.1fx%.1fmm、小さい方の面積の %.0f%%"
-                              % ((a.text or a.name)[:16].replace("\n", " "), a.kind,
-                                 (b.text or b.name)[:16].replace("\n", " "), b.kind,
-                                 mm(ix), mm(iy), ratio * 100),
-                })
+                findings[sno].append(
+                    {
+                        "type": "重なり",
+                        "elem": a,
+                        "label": "",
+                        "head": (a.text or a.name)[:24].replace("\n", " "),
+                        "detail": "「%s」(%s) と「%s」(%s) が重なる。重なり %.1fx%.1fmm、小さい方の面積の %.0f%%"
+                        % (
+                            (a.text or a.name)[:16].replace("\n", " "),
+                            a.kind,
+                            (b.text or b.name)[:16].replace("\n", " "),
+                            b.kind,
+                            mm(ix),
+                            mm(iy),
+                            ratio * 100,
+                        ),
+                    }
+                )
     return findings, stats
 
 
@@ -398,8 +477,10 @@ def build_report(path, prs, slides, findings, stats, cfg):
     L = []
     L.append("# ReSlide レポート: %s" % Path(path).name)
     L.append("")
-    L.append("- スライド数: %d / サイズ: %.0f x %.0f mm（単位はすべて mm、フォントは pt）"
-             % (len(slides), mm(prs.slide_width), mm(prs.slide_height)))
+    L.append(
+        "- スライド数: %d / サイズ: %.0f x %.0f mm（単位はすべて mm、フォントは pt）"
+        % (len(slides), mm(prs.slide_width), mm(prs.slide_height))
+    )
     L.append("- 基準値: 本文の下限 %gpt（設定ファイルの値）" % cfg["body_min_pt"])
     total = sum(len(v) for v in findings.values())
     L.append("- 指摘の合計: %d 件" % total)
@@ -409,11 +490,17 @@ def build_report(path, prs, slides, findings, stats, cfg):
     L.append("- 文字数（run単位で数えた全テキスト）: %d" % stats["chars_total"])
     L.append("- **未解決の文字数: %d**" % stats["chars_unresolved"])
     for src, n in sorted(stats["by_src"].items(), key=lambda x: -x[1]):
-        mark = "（既定値。明示指定が無く継承で決まった分）" if src in DEFAULT_SOURCES else ""
+        mark = (
+            "（既定値。明示指定が無く継承で決まった分）"
+            if src in DEFAULT_SOURCES
+            else ""
+        )
         L.append("  - 解決元 %s: %d文字%s" % (src, n, mark))
     if stats["unresolved"]:
         L.append("")
-        L.append("未解決の箇所（サイズが取れなかったため判定対象外。黙って落とさず列挙）:")
+        L.append(
+            "未解決の箇所（サイズが取れなかったため判定対象外。黙って落とさず列挙）:"
+        )
         for s, name, label, head in stats["unresolved"][:50]:
             L.append("  - スライド%d「%s」%s 冒頭「%s」" % (s, name, label, head))
     L.append("")
@@ -426,8 +513,19 @@ def build_report(path, prs, slides, findings, stats, cfg):
             L.append("指摘なし")
         for f in findings[sno]:
             e = f["elem"]
-            L.append("- [%s] %s%s 「%s」" % (f["type"], e.kind, (" " + f["label"]) if f["label"] else "", f["head"]))
-            L.append("  - 要素: %s / 位置(%.1f, %.1f)mm 大きさ %.1fx%.1fmm" % (e.name, mm(e.x), mm(e.y), mm(e.w), mm(e.h)))
+            L.append(
+                "- [%s] %s%s 「%s」"
+                % (
+                    f["type"],
+                    e.kind,
+                    (" " + f["label"]) if f["label"] else "",
+                    f["head"],
+                )
+            )
+            L.append(
+                "  - 要素: %s / 位置(%.1f, %.1f)mm 大きさ %.1fx%.1fmm"
+                % (e.name, mm(e.x), mm(e.y), mm(e.w), mm(e.h))
+            )
             L.append("  - %s" % f["detail"])
     L.append("")
     L.append("## 注記類として本文の下限を当てなかったもの")
@@ -435,15 +533,28 @@ def build_report(path, prs, slides, findings, stats, cfg):
     if not stats["notes"]:
         L.append("なし")
     for s, name, label, why, size, head in stats["notes"]:
-        L.append("- スライド%d「%s」%s 「%s」 サイズ %s / 根拠: %s"
-                 % (s, name, label, head.replace("\n", " "), ("%.1fpt" % size) if size else "未解決", why))
+        L.append(
+            "- スライド%d「%s」%s 「%s」 サイズ %s / 根拠: %s"
+            % (
+                s,
+                name,
+                label,
+                head.replace("\n", " "),
+                ("%.1fpt" % size) if size else "未解決",
+                why,
+            )
+        )
     L.append("")
     L.append("## 対象外・前提")
     L.append("")
     L.append("- グラフ・SmartArt の内部の文字は読まない（要素の位置と大きさのみ）。")
     L.append("- 回転した要素は回転前の矩形で判定する。")
-    L.append("- 継承（レイアウト・マスター）で決まる値は、プレースホルダの対応付けが取れた範囲で解決する。表スタイル由来のサイズは見ない。")
-    L.append("- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線は除外）。")
+    L.append(
+        "- 継承（レイアウト・マスター）で決まる値は、プレースホルダの対応付けが取れた範囲で解決する。表スタイル由来のサイズは見ない。"
+    )
+    L.append(
+        "- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線は除外）。"
+    )
     return "\n".join(L) + "\n"
 
 
@@ -456,10 +567,18 @@ def sha256(path):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="pptx の見やすさ問題をレポートする（読み取り専用）")
+    ap = argparse.ArgumentParser(
+        description="pptx の見やすさ問題をレポートする（読み取り専用）"
+    )
     ap.add_argument("pptx")
-    ap.add_argument("--config", default=str(Path(__file__).with_name("reslide_config.json")))
-    ap.add_argument("--out", default=None, help="Markdownレポートの出力先（既定: カレントに <名前>_reslide_report.md）")
+    ap.add_argument(
+        "--config", default=str(Path(__file__).with_name("reslide_config.json"))
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help="Markdownレポートの出力先（既定: カレントに <名前>_reslide_report.md）",
+    )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
         try:
