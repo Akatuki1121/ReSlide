@@ -22,6 +22,7 @@ import unicodedata
 from pathlib import Path
 
 from pptx import Presentation
+from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 
 EMU_PER_MM = 36000.0
@@ -194,9 +195,7 @@ class TextUnit:
 
     def __init__(self, label, paragraphs, scale, inner_w=0, inner_h=0):
         self.label = label  # 例: "" / "セル(2,3)"
-        self.paragraphs = (
-            paragraphs  # [{"text","runs":[(n,size,src)],"run_els":[(要素,文字列)]}]
-        )
+        self.paragraphs = paragraphs  # [{"text","runs":[(n,size,src)],"run_els":[(要素,文字列)],"colors":[(r,g,b)|None]}]
         self.scale = scale
         self.inner_w = inner_w  # 枠の内側（余白を差し引いた）幅・EMU・絶対座標
         self.inner_h = inner_h  # 同・高さ
@@ -206,11 +205,48 @@ class TextUnit:
         return "\n".join(p["text"] for p in self.paragraphs if p["text"].strip())
 
 
+def _srgb_of_props(props_el):
+    """rPr 相当の要素に明示された srgbClr を (r, g, b) で返す。無ければ None。
+
+    取るのは明示の RGB だけ。テーマ色（schemeClr 等）や自動色は解決できない
+    ので対象にしない。
+    """
+    if props_el is None:
+        return None
+    srgb = props_el.find("a:solidFill/a:srgbClr", NS)
+    if srgb is None:
+        return None
+    v = srgb.get("val") or ""
+    if len(v) != 6:
+        return None
+    try:
+        return (int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _run_color(p_el, r_el):
+    """run の文字色 (r, g, b)。run の rPr → 段落の defRPr → endParaRPr の順に探す。
+
+    いずれもスライド内に明示された RGB だけを見る。継承（レイアウトや
+    マスター）やテーマ色は辿らない。
+    """
+    color = _srgb_of_props(r_el.find("a:rPr", NS))
+    if color is not None:
+        return color
+    ppr = p_el.find("a:pPr", NS)
+    if ppr is not None:
+        color = _srgb_of_props(ppr.find("a:defRPr", NS))
+        if color is not None:
+            return color
+    return _srgb_of_props(p_el.find("a:endParaRPr", NS))
+
+
 def read_text_unit(resolver, shape, txbody, label="", inner_w=0, inner_h=0):
     scale = autofit_scale(shape) if label == "" else 1.0
     paras = []
     for p_el in txbody.findall("a:p", NS):
-        runs, run_els, text_parts = [], [], []
+        runs, run_els, colors, text_parts = [], [], [], []
         for child in p_el:
             if child.tag in (A + "r", A + "fld"):
                 t = child.find("a:t", NS)
@@ -219,10 +255,18 @@ def read_text_unit(resolver, shape, txbody, label="", inner_w=0, inner_h=0):
                     size, src = resolver.resolve(shape, p_el, child)
                     runs.append((len(txt.replace("\n", "")), size, src))
                     run_els.append((child, txt))
+                    colors.append(_run_color(p_el, child))
                 text_parts.append(txt)
             elif child.tag == A + "br":
                 text_parts.append("\n")
-        paras.append({"text": "".join(text_parts), "runs": runs, "run_els": run_els})
+        paras.append(
+            {
+                "text": "".join(text_parts),
+                "runs": runs,
+                "run_els": run_els,
+                "colors": colors,
+            }
+        )
     return TextUnit(label, paras, scale, inner_w, inner_h)
 
 
@@ -370,8 +414,41 @@ def read_presentation(prs, resolver):
 
 
 # ---------------------------------------------------------------- 判定
-def classify(elem, unit, cfg):
-    """(役割, 根拠) を返す。役割: title / note / label / body"""
+def _min_size(unit):
+    """ユニット内の解決済みフォントサイズの最小値（実効値）。無ければ None。"""
+    sizes = [
+        size * unit.scale
+        for p in unit.paragraphs
+        for (n, size, src) in p["runs"]
+        if size is not None
+    ]
+    return min(sizes) if sizes else None
+
+
+def _label_shape_chars(unit, cfg):
+    """ラベルの形を満たす場合に、そのテキストの文字数を返す。
+
+    形とは、表のセルでなく、1段落のみ・改行なし・設定の文字数以下であること。
+    満たさなければ None。
+    """
+    if unit.label != "":
+        return None
+    texts = [p["text"] for p in unit.paragraphs if p["text"].strip()]
+    if len(texts) != 1 or "\n" in texts[0]:
+        return None
+    n = len(texts[0].strip())
+    if n > cfg.get("label_max_chars", 30):
+        return None
+    return n
+
+
+def classify(elem, unit, cfg, body_median=None):
+    """(役割, 根拠) を返す。役割: title / note / label / body
+
+    body_median は、そのスライドの本文の中央値（slide_body_median の結果）。
+    ラベルの形をした短文でも、大きさが本文の中央値とほぼ同じものは、
+    図の名前ではなく要約の一文など本文の役割とみなして本文に返す。
+    """
     if elem.ph_type in cfg["title_placeholder_types"]:
         return "title", "タイトル用プレースホルダ(%s)" % elem.ph_type
     if elem.ph_type in cfg["note_placeholder_types"]:
@@ -382,14 +459,49 @@ def classify(elem, unit, cfg):
             return "note", "先頭が「%s」で始まる注記" % pre
     if first and re.match(cfg["page_number_regex"], unit.text.strip()):
         return "note", "ページ番号の書式（数字のみ／n/m）"
-    # ラベル: 表のセルでなく、1段落のみ・改行なし・短いテキスト
-    if unit.label == "":
-        texts = [p["text"] for p in unit.paragraphs if p["text"].strip()]
-        if len(texts) == 1 and "\n" not in texts[0]:
-            n = len(texts[0].strip())
-            if n <= cfg.get("label_max_chars", 30):
-                return "label", "1段落・改行なし・%d文字のためラベル" % n
-    return "body", "上記に該当しないため本文"
+    n = _label_shape_chars(unit, cfg)
+    if n is not None:
+        if body_median is not None:
+            size = _min_size(unit)
+            if size is not None:
+                ratio = size / body_median
+                if (
+                    cfg.get("relative_min_ratio", 0.7)
+                    <= ratio
+                    <= cfg.get("label_body_max_ratio", 1.15)
+                ):
+                    return (
+                        "body",
+                        "大きさ %.1fpt がスライドの本文の中央値 %.1fpt とほぼ同じため本文"
+                        % (size, body_median),
+                    )
+        return "label", "1段落・改行なし・%d文字" % n
+    return "body", "見出し・注記・ラベルに当たらない本文"
+
+
+def slide_body_median(elems, cfg):
+    """そのスライドの本文の中央値（文字数で重み付け）を返す。無ければ None。
+
+    ラベルの形をした短文は本文に数えない。それ以外の本文が2つ以上ある
+    スライドだけを対象にする（1つだけでは「周り」が無いため）。
+    """
+    pairs = []
+    n_body = 0
+    for e in elems:
+        for u in e.units:
+            if not u.text.strip():
+                continue
+            role, _why = classify(e, u, cfg)
+            if role != "body":
+                continue
+            n_body += 1
+            for p in u.paragraphs:
+                for n, size, _src in p["runs"]:
+                    if size is not None:
+                        pairs.append((size * u.scale, n))
+    if n_body < 2:
+        return None
+    return _weighted_median(pairs)
 
 
 ROLE_JP = {"body": "本文", "label": "ラベル"}
@@ -412,7 +524,56 @@ def _weighted_median(pairs):
     return None
 
 
-def judge(slides, cfg, slide_w, slide_h):
+def _luminance(rgb):
+    """相対輝度（WCAG の定義）。"""
+
+    def f(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = rgb
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def _contrast_ratio(c1, c2):
+    """2色のコントラスト比（WCAG の定義）。1.0〜21.0。"""
+    l1, l2 = _luminance(c1), _luminance(c2)
+    hi, lo = max(l1, l2), min(l1, l2)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _solid_bg_color(owner):
+    """slide / layout / master の背景が単色の塗りで RGB が取れる場合だけ (r, g, b) を返す。
+
+    画像やグラデーションの背景、テーマ色の背景は対象にしない。
+    """
+    try:
+        fill = owner.background.fill
+        if fill.type == MSO_FILL.SOLID and fill.fore_color.type == MSO_COLOR_TYPE.RGB:
+            rgb = fill.fore_color.rgb
+            return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+    except Exception:
+        pass
+    return None
+
+
+def slide_backgrounds(prs):
+    """スライドごとの背景色 (r, g, b) のリスト。単色として取れないスライドは None。
+
+    スライド → レイアウト → マスターの順に探し、最初に取れた単色を使う。
+    """
+    out = []
+    for slide in prs.slides:
+        color = None
+        for owner in (slide, slide.slide_layout, slide.slide_layout.slide_master):
+            color = _solid_bg_color(owner)
+            if color is not None:
+                break
+        out.append(color)
+    return out
+
+
+def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
     findings = {i: [] for i in range(1, len(slides) + 1)}
     stats = {
         "chars_total": 0,
@@ -429,19 +590,37 @@ def judge(slides, cfg, slide_w, slide_h):
     for sno, elems in enumerate(slides, 1):
         body_units = []  # このスライドの本文ユニット (要素, ユニット, 最小サイズ, 根拠)
         body_pairs = []  # このスライドの本文の (サイズ, 文字数)。中央値用
+        label_median = slide_body_median(elems, cfg)
+        bg = backgrounds[sno - 1] if backgrounds else None
         for e in elems:
             for u in e.units:
                 if not u.text.strip():
                     continue
                 stats["units"] += 1
-                role, why = classify(e, u, cfg)
+                role, why = classify(e, u, cfg, label_median)
                 floor_u = floors.get(role)
                 small_chars = total = 0
                 sizes = []
+                contrast_worst = (
+                    None  # (比, 文字色, しきい値)。しきい値未満で最も低いもの
+                )
                 for p in u.paragraphs:
-                    for n, size, src in p["runs"]:
+                    for (n, size, src), color in zip(p["runs"], p["colors"]):
                         total += n
                         stats["chars_total"] += n
+                        if bg is not None and color is not None:
+                            eff_c = size * u.scale if size is not None else None
+                            limit_c = (
+                                cfg.get("contrast_min_ratio_large", 3.0)
+                                if eff_c is not None
+                                and eff_c >= cfg.get("contrast_large_pt", 18)
+                                else cfg.get("contrast_min_ratio", 4.5)
+                            )
+                            ratio_c = _contrast_ratio(color, bg)
+                            if ratio_c < limit_c and (
+                                contrast_worst is None or ratio_c < contrast_worst[0]
+                            ):
+                                contrast_worst = (ratio_c, color, limit_c)
                         if size is None:
                             stats["chars_unresolved"] += n
                             stats["unresolved"].append(
@@ -491,16 +670,36 @@ def judge(slides, cfg, slide_w, slide_h):
                             "elem": e,
                             "label": u.label,
                             "head": u.text[:24].replace("\n", " "),
-                            "detail": "最小 %.1fpt / %sの下限 %gpt（%d/%d文字が下限未満）%s。役割=%s（%s）"
+                            "detail": "最小 %.1fpt（下限 %gpt、%d/%d文字が下限未満）%s。役割=%s（%s）"
                             % (
                                 min(sizes),
-                                ROLE_JP[role],
                                 floor_u,
                                 small_chars,
                                 total,
                                 scale_note,
                                 ROLE_JP[role],
                                 why,
+                            ),
+                        }
+                    )
+                if contrast_worst is not None:
+                    ratio_c, color_c, limit_c = contrast_worst
+                    findings[sno].append(
+                        {
+                            "type": "コントラストが低い",
+                            "elem": e,
+                            "label": u.label,
+                            "head": u.text[:24].replace("\n", " "),
+                            "detail": "文字色 #%02X%02X%02X / 背景色 #%02X%02X%02X / コントラスト比 %.2f（しきい値 %.1f 未満）"
+                            % (
+                                color_c[0],
+                                color_c[1],
+                                color_c[2],
+                                bg[0],
+                                bg[1],
+                                bg[2],
+                                ratio_c,
+                                limit_c,
                             ),
                         }
                     )
@@ -521,7 +720,7 @@ def judge(slides, cfg, slide_w, slide_h):
                                 "elem": e,
                                 "label": u.label,
                                 "head": u.text[:24].replace("\n", " "),
-                                "detail": "最小 %.1fpt は、スライドの本文の中央値 %.1fpt の %.0f%% で、しきい値（中央値の%.0f%%）を下回る。絶対値の下限 %gpt は満たしている。役割=本文（%s）"
+                                "detail": "最小 %.1fpt はスライドの本文の中央値 %.1fpt の %.0f%% で、しきい値 %.0f%% を下回る。本文の下限 %gpt は満たしている。役割=本文（%s）"
                                 % (
                                     unit_min,
                                     med,
@@ -655,17 +854,6 @@ def _est_height_mm(unit, raise_to):
     return total
 
 
-def _min_size(unit):
-    """ユニット内の解決済みフォントサイズの最小値（実効値）。無ければ None。"""
-    sizes = [
-        size * unit.scale
-        for p in unit.paragraphs
-        for (n, size, src) in p["runs"]
-        if size is not None
-    ]
-    return min(sizes) if sizes else None
-
-
 def _fit_size(unit, floor):
     """floor 以下で枠に収まる最大のサイズ(pt)。現状の最小サイズ以下なら None。"""
     cur_min = _min_size(unit)
@@ -706,6 +894,7 @@ def _needed_heading_size(elems, heading, heading_size, cap, cfg):
     """
     margin = cfg.get("heading_margin_pt", 2)
     floor = cfg["body_min_pt"]
+    median = slide_body_median(elems, cfg)
     needed = None
     for e in elems:
         if e is heading:
@@ -713,7 +902,7 @@ def _needed_heading_size(elems, heading, heading_size, cap, cfg):
         for u in e.units:
             if not u.text.strip():
                 continue
-            role, _why = classify(e, u, cfg)
+            role, _why = classify(e, u, cfg, median)
             if role != "body":
                 continue
             cur_min = _min_size(u)
@@ -787,6 +976,7 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
     floors = {"body": cfg["body_min_pt"], "label": cfg.get("label_min_pt", 18)}
     margin = cfg.get("heading_margin_pt", 2)
     for sno, elems in enumerate(slides, 1):
+        label_median = slide_body_median(elems, cfg)
         # 階層の保護: 見出しのサイズからマージンを引いた値を、本文を拡大する
         # ときの上限にする。見出しの決め方は分割・並び替えと同じ _split_heading
         # に揃える
@@ -804,14 +994,14 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
                 raised = _raise_heading(heading, heading_size, needed)
                 if raised is not None:
                     detail = (
-                        "見出し %.1fpt → %.1fpt（本文を下限 %gpt まで上げるため、"
-                        "見出しと本文の大きさの順序と元の比率を保つのに必要な大きさへ拡大）"
+                        "見出し %.1fpt → %.1fpt（本文を下限 %gpt まで上げるため。"
+                        "見出しと本文の元の比率を保つ大きさ）"
                         % (heading_size, raised, floors["body"])
                     )
                     if raised < needed:
                         detail += (
-                            "。必要な大きさ %.1fpt までは枠に収まらないため、"
-                            "収まる最大に留めた" % needed
+                            "。必要だった %.1fpt までは枠に収まらず、収まる最大にした"
+                            % needed
                         )
                     label = next((u.label for u in heading.units if u.text.strip()), "")
                     rec(sno, "サイズ", heading, label, detail)
@@ -823,7 +1013,7 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
             for u in e.units:
                 if not u.text.strip():
                     continue
-                role, why = classify(e, u, cfg)
+                role, why = classify(e, u, cfg, label_median)
                 floor = floors.get(role)
                 if floor is None:
                     continue
@@ -841,8 +1031,8 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
                             "未解消",
                             e,
                             u.label,
-                            "見出し（%.1fpt）との大きさの順序を保つため、拡大の上限は %.1fpt（見出し − マージン %gpt）となり、現在の最小 %.1fpt 以下になるため拡大しなかった。役割=本文（%s）"
-                            % (heading_size, cap, margin, cur_min, why),
+                            "拡大の上限 %.1fpt（見出し %.1fpt − マージン %gpt）が現在の最小 %.1fpt 以下になるため、拡大しなかった。役割=本文（%s）"
+                            % (cap, heading_size, margin, cur_min, why),
                             head=u.text,
                         )
                         continue
@@ -856,8 +1046,11 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
                 )
                 if desired < floor:
                     detail += (
-                        "。見出し（%.1fpt）との順序を保つため、上限 %.1fpt に抑えた"
-                        % (heading_size, cap)
+                        "。見出し %.1fpt より大きくしないため、上限 %.1fpt に抑えた"
+                        % (
+                            heading_size,
+                            cap,
+                        )
                     )
                 rec(sno, "サイズ", e, u.label, detail, head=u.text)
 
@@ -1088,7 +1281,7 @@ def _split_heading(elems, cfg):
     return best
 
 
-def _is_note_only(e, cfg):
+def _is_note_only(e, cfg, body_median=None):
     """テキストの役割がすべて注記（出典・ページ番号など）の要素か。
 
     注記はスライドの付属物として元のスライドに残す
@@ -1099,7 +1292,7 @@ def _is_note_only(e, cfg):
         if not u.text.strip():
             continue
         seen = True
-        role, _why = classify(e, u, cfg)
+        role, _why = classify(e, u, cfg, body_median)
         if role != "note":
             return False
     return seen
@@ -1112,13 +1305,14 @@ def _split_movable(elems, heading, cfg):
     なければ移せないため対象にしない。画像は元のスライドに残し、
     表・グラフ・SmartArt は内部を割らず要素ごと移す。
     """
+    median = slide_body_median(elems, cfg)
     out = []
     for e in elems:
         if e is heading or e.shape is None or e.in_group:
             continue
         if not (e.has_text or e.kind in SPLIT_MOVABLE_KINDS):
             continue
-        if _is_note_only(e, cfg):
+        if _is_note_only(e, cfg, median):
             continue
         out.append(e)
     out.sort(key=lambda e: (e.y, e.x))
@@ -1276,9 +1470,10 @@ def _content_chars(elems, heading, cfg):
     スライドの付属物として本文に数えない。注記だけの要素かの判定は、
     分割で元のスライドに残す判定に使った _is_note_only と同じ。
     """
+    median = slide_body_median(elems, cfg)
     total = 0
     for e in elems:
-        if e is heading or _is_note_only(e, cfg):
+        if e is heading or _is_note_only(e, cfg, median):
             continue
         total += sum(len(u.text) for u in e.units)
     return total
@@ -1355,9 +1550,10 @@ def _toc_candidate(sno, elems, heading, slides, heads, cfg):
     する。候補の順序は、食い違うスライド同士が占めている位置の中でだけ
     目次の並びに入れ替えたもので、関係ないスライドは動かさない。
     """
+    median = slide_body_median(elems, cfg)
     lines = []
     for e in elems:
-        if e is heading or _is_note_only(e, cfg):
+        if e is heading or _is_note_only(e, cfg, median):
             continue
         for u in e.units:
             for p in u.paragraphs:
@@ -1504,7 +1700,7 @@ def build_report(
         L.append("## 資料全体の文字の小ささ")
         L.append("")
         L.append(
-            "- 資料全体の文字が小さめです（本文の中央値 %.1fpt / 本文の下限 %gpt）。個々の文字への指摘とは別枠の通知で、指摘の合計には数えていません"
+            "- 資料全体の文字が小さめです（本文の中央値 %.1fpt / 本文の下限 %gpt）"
             % (body_median_all, cfg["body_min_pt"])
         )
     L.append("")
@@ -1513,17 +1709,11 @@ def build_report(
     L.append("- 文字数（run単位で数えた全テキスト）: %d" % stats["chars_total"])
     L.append("- **未解決の文字数: %d**" % stats["chars_unresolved"])
     for src, n in sorted(stats["by_src"].items(), key=lambda x: -x[1]):
-        mark = (
-            "（既定値。明示指定が無く継承で決まった分）"
-            if src in DEFAULT_SOURCES
-            else ""
-        )
+        mark = "（指定がなく、既定値で決まった分）" if src in DEFAULT_SOURCES else ""
         L.append("  - 解決元 %s: %d文字%s" % (src, n, mark))
     if stats["unresolved"]:
         L.append("")
-        L.append(
-            "未解決の箇所（サイズが取れなかったため判定対象外。黙って落とさず列挙）:"
-        )
+        L.append("未解決の箇所（サイズが取れず、判定していない）:")
         for s, name, label, head in stats["unresolved"][:50]:
             L.append("  - スライド%d「%s」%s 冒頭「%s」" % (s, name, label, head))
     L.append("")
@@ -1605,9 +1795,7 @@ def build_report(
         if not reorder_candidates:
             L.append("候補なし")
         else:
-            L.append(
-                "- 実行するには --reorder-apply <候補番号> を指定する。選ばない限り、ファイルは作られない"
-            )
+            L.append("- 実行するには --reorder-apply <候補番号> を指定する")
             for c in reorder_candidates:
                 L.append("")
                 L.append("### 候補 %d: %s" % (c["no"], CANDIDATE_KIND_JP[c["kind"]]))
@@ -1620,10 +1808,13 @@ def build_report(
     L.append("- グラフ・SmartArt の内部の文字は読まない（要素の位置と大きさのみ）。")
     L.append("- 回転した要素は回転前の矩形で判定する。")
     L.append(
-        "- 継承（レイアウト・マスター）で決まる値は、プレースホルダの対応付けが取れた範囲で解決する。表スタイル由来のサイズは見ない。"
+        "- レイアウトやマスターから継承する値は、プレースホルダの対応付けが取れた範囲で解決する。表スタイル由来のサイズは見ない。"
     )
     L.append(
         "- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線、図(画像)同士は除外）。"
+    )
+    L.append(
+        "- 文字色のコントラストは、文字色が明示の RGB で取れ、背景がスライド・レイアウト・マスターの単色の塗りで取れる場合だけ判定する。テーマ色や自動色の文字、画像やグラデーションの背景は対象外。"
     )
     return "\n".join(L) + "\n"
 
@@ -1744,7 +1935,9 @@ def main(argv=None):
         print("調整後ファイル: %s" % out_pptx.resolve())
         print("変更一覧の保存先: %s" % out.resolve())
     else:
-        findings, stats = judge(slides, cfg, prs.slide_width, prs.slide_height)
+        findings, stats = judge(
+            slides, cfg, prs.slide_width, prs.slide_height, slide_backgrounds(prs)
+        )
         report = build_report(
             src, prs, slides, findings, stats, cfg, verdicts, candidates
         )
