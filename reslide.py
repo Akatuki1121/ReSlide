@@ -5,6 +5,8 @@
        python reslide.py <対象.pptx> --fix   … 自動調整（フェーズ2）
        python reslide.py <対象.pptx> --split … 分割候補の判定だけをレポートする（フェーズ3）
        python reslide.py <対象.pptx> --fix --split … 自動調整に加えてページ分割も行う
+       python reslide.py <対象.pptx> --reorder … 並び替え候補だけをレポートする（フェーズ4）
+       python reslide.py <対象.pptx> --reorder-apply <候補番号> … 選んだ候補だけ並び替えて保存する
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
 --fix の結果は <元名>_reslide.pptx へ新規保存し、変更一覧を Markdown で出す。
 """
@@ -803,6 +805,9 @@ def build_changes_report(path, out_name, changes):
     )
     if n_split:
         L.append("- うちページ分割: %d件" % n_split)
+    n_reorder = sum(1 for c in changes if c["type"] == "並び替え")
+    if n_reorder:
+        L.append("- うち並び替え: %d件" % n_reorder)
     if not changes:
         L.append("")
         L.append("変更なし")
@@ -1082,8 +1087,250 @@ def apply_splits(prs, slide_objs, slides, verdicts, cfg):
     return changes
 
 
+# ---------------------------------------------------------------- ページ並び替え（フェーズ4）
+def _norm_for_match(text):
+    """見出しと目次行の照合用にテキストを正規化する。
+
+    空白をすべて取り除き、先頭の番号付け（「1.」「２、」など）と末尾の
+    句点を落とす。番号や空白の有無で照合がぶれないようにするためで、
+    照合はこの正規化後の一致・包含だけで行う。
+    """
+    t = re.sub(r"\s+", "", text)
+    t = re.sub(r"^[0-9０-９]+[.．、:：)）]", "", t)
+    return t.rstrip("。")
+
+
+def _heading_of(elems, cfg):
+    """スライドの見出し要素と、その先頭行のテキストを返す。無ければ (None, "")。
+
+    見出しの決め方は分割（_split_heading）と同じ。テキストは先頭の
+    空でない行だけを使う（複数行の見出しは1行目が表題という前提）。
+    """
+    heading = _split_heading(elems, cfg)
+    if heading is None:
+        return None, ""
+    for line in heading.text.split("\n"):
+        if line.strip():
+            return heading, line.strip()
+    return heading, ""
+
+
+def _content_chars(elems, heading, cfg):
+    """見出し要素と注記だけの要素を除いた、本文の文字数。
+
+    「タイトルだけのスライド」の判定に使う。注記（出典・ページ番号など）は
+    スライドの付属物として本文に数えない。注記だけの要素かの判定は、
+    分割で元のスライドに残す判定に使った _is_note_only と同じ。
+    """
+    total = 0
+    for e in elems:
+        if e is heading or _is_note_only(e, cfg):
+            continue
+        total += sum(len(u.text) for u in e.units)
+    return total
+
+
+def _order_text(order, heads_text):
+    """順序を「1「見出し」 → 2「見出し」」の形で返す。"""
+    parts = []
+    for no in order:
+        head = heads_text.get(no, "")
+        parts.append("%d「%s」" % (no, head[:16] if head else "（見出しなし）"))
+    return " → ".join(parts)
+
+
+def _title_candidate(sno, head_text, body_chars, slides, heads, cfg):
+    """タイトルだけのスライド sno に対する候補。該当しなければ None。
+
+    「内容に当たるスライド」は、見出し同士を正規化したうえで一方が他方を
+    含む関係にあり、本文を持つ（タイトルだけではない）スライドとする。
+    最も手前の内容スライドを控え、それより後ろにある場合だけ候補にする
+    （既に前にあるなら直すところが無い）。
+    """
+    limit = cfg["reorder_title_only_max_body_chars"]
+    nh = _norm_for_match(head_text)
+    if not nh:
+        return None
+    anchor = None
+    anchor_head = ""
+    for j, elems in enumerate(slides, 1):
+        if j == sno:
+            continue
+        h_elem, h_text = heads[j]
+        if h_elem is None or not h_text:
+            continue
+        nj = _norm_for_match(h_text)
+        if not nj or (nh not in nj and nj not in nh):
+            continue
+        if _content_chars(elems, h_elem, cfg) <= limit:
+            continue  # 見出しが関係しても、相手もタイトルだけなら内容とは言えない
+        anchor, anchor_head = j, h_text
+        break
+    if anchor is None or anchor > sno:
+        return None
+    order = list(range(1, len(slides) + 1))
+    order.remove(sno)
+    order.insert(anchor - 1, sno)
+    nj = _norm_for_match(anchor_head)
+    if nh == nj:
+        rel = "見出しが一致する"
+    elif nh in nj:
+        rel = "見出し「%s」が相手の見出しに含まれる" % head_text
+    else:
+        rel = "相手の見出し「%s」がこの見出しに含まれる" % anchor_head
+    reason = (
+        "スライド%d「%s」は見出しのみで、本文は%d文字（しきい値%d文字以下）しかない。"
+        "%sスライド%d「%s」が内容に当たり、その後ろにある"
+        % (sno, head_text, body_chars, limit, rel, anchor, anchor_head)
+    )
+    return {
+        "kind": "title",
+        "slide": sno,
+        "head": head_text,
+        "order": order,
+        "reason": reason,
+    }
+
+
+def _toc_candidate(sno, elems, heading, slides, heads, cfg):
+    """目次に当たるスライド sno に対する候補。該当しなければ None。
+
+    見出し要素と注記を除いた行のうち、他のスライドの見出しと正規化後に
+    完全一致する行を目次の項目とみなす。一致が設定件数以上あり、項目の
+    並び（= 対応するスライドの並び）と実際の順序が食い違う場合だけ候補に
+    する。候補の順序は、食い違うスライド同士が占めている位置の中でだけ
+    目次の並びに入れ替えたもので、関係ないスライドは動かさない。
+    """
+    lines = []
+    for e in elems:
+        if e is heading or _is_note_only(e, cfg):
+            continue
+        for u in e.units:
+            for p in u.paragraphs:
+                for line in p["text"].split("\n"):
+                    if line.strip():
+                        lines.append(line.strip())
+    by_norm = {}
+    for j, (h_elem, h_text) in heads.items():
+        if j == sno or h_elem is None or not h_text:
+            continue
+        nj = _norm_for_match(h_text)
+        if nj and nj not in by_norm:
+            by_norm[nj] = j
+    matches = []  # (行テキスト, 対応するスライド番号) を行の順に並べたもの
+    seen = set()
+    for line in lines:
+        j = by_norm.get(_norm_for_match(line))
+        if j is not None and j not in seen:
+            seen.add(j)
+            matches.append((line, j))
+    if len(matches) < cfg["reorder_toc_min_matches"]:
+        return None
+    seq = [j for _line, j in matches]
+    if seq == sorted(seq):
+        return None  # 目次の並びと実際の順序が一致している
+    order = list(range(1, len(slides) + 1))
+    for k, pos in enumerate(sorted(seq)):
+        order[pos - 1] = seq[k]
+    detail = "、".join("「%s」→スライド%d" % (line, j) for line, j in matches)
+    reason = (
+        "スライド%dは目次に当たり、見出しと一致する行が%d件ある（%s）。"
+        "行の並びはスライド%sの順だが、実際は%sの順に並んでいて食い違う"
+        % (
+            sno,
+            len(matches),
+            detail,
+            "→".join(str(j) for j in seq),
+            "→".join(str(j) for j in sorted(seq)),
+        )
+    )
+    return {
+        "kind": "toc",
+        "slide": sno,
+        "head": heads[sno][1],
+        "order": order,
+        "reason": reason,
+    }
+
+
+def judge_reorder(slides, cfg):
+    """並び替え候補の一覧を返す。根拠がテキストから読み取れる場合だけ出す。
+
+    候補は2種類で、どちらも現在の順序・候補の順序・根拠を持つ。
+    番号（no）はレポートへの掲載順に振り、--reorder-apply はこの番号で選ぶ。
+    - title: タイトルだけのスライドが、その内容に当たるスライドより後ろにある
+    - toc: 目次に当たるスライドの行の順序と、実際のスライド順序が食い違う
+    """
+    heads = {}
+    for sno, elems in enumerate(slides, 1):
+        heads[sno] = _heading_of(elems, cfg)
+    heads_text = {sno: text for sno, (_elem, text) in heads.items()}
+    limit = cfg["reorder_title_only_max_body_chars"]
+    candidates = []
+    for sno, elems in enumerate(slides, 1):
+        heading, head_text = heads[sno]
+        if heading is None or not head_text:
+            continue
+        toc = _toc_candidate(sno, elems, heading, slides, heads, cfg)
+        if toc is not None:
+            candidates.append(toc)
+        body_chars = _content_chars(elems, heading, cfg)
+        if body_chars > limit:
+            continue
+        title = _title_candidate(sno, head_text, body_chars, slides, heads, cfg)
+        if title is not None:
+            candidates.append(title)
+    for i, c in enumerate(candidates, 1):
+        c["no"] = i
+        c["current"] = list(range(1, len(slides) + 1))
+        c["heads"] = heads_text
+    return candidates
+
+
+def apply_reorder(prs, candidate):
+    """候補の順序を sldIdLst の並び替えで適用し、変更の記録を返す。
+
+    スライド部品そのものは作り直さず、表示順を決める sldIdLst の並びだけを
+    入れ替える（分割の _insert_slide_after と同じ考え方）。既存の sldId を
+    候補の順に append し直すと、その順に並ぶ。
+    """
+    sldIdLst = prs.part._element.find("p:sldIdLst", NS)
+    ids = list(sldIdLst)
+    for idx in candidate["order"]:
+        sldIdLst.append(ids[idx - 1])
+    return {
+        "slide": candidate["slide"],
+        "type": "並び替え",
+        "elem": "（スライド全体）",
+        "label": "",
+        "head": candidate["head"],
+        "detail": "候補%dを適用。現在の順序 %s → 候補の順序 %s。根拠: %s"
+        % (
+            candidate["no"],
+            _order_text(candidate["current"], candidate["heads"]),
+            _order_text(candidate["order"], candidate["heads"]),
+            candidate["reason"],
+        ),
+    }
+
+
+CANDIDATE_KIND_JP = {
+    "title": "タイトルだけのスライドを、その内容の前へ出す",
+    "toc": "目次の並びに合わせて入れ替える",
+}
+
+
 # ---------------------------------------------------------------- レポート
-def build_report(path, prs, slides, findings, stats, cfg, split_verdicts=None):
+def build_report(
+    path,
+    prs,
+    slides,
+    findings,
+    stats,
+    cfg,
+    split_verdicts=None,
+    reorder_candidates=None,
+):
     L = []
     L.append("# ReSlide レポート: %s" % Path(path).name)
     L.append("")
@@ -1188,6 +1435,22 @@ def build_report(path, prs, slides, findings, stats, cfg, split_verdicts=None):
         )
         for v in split_verdicts:
             L.append("- スライド%d: %s" % (v["slide"], _split_reason(v, cfg)))
+    if reorder_candidates is not None:
+        L.append("")
+        L.append("## ページ並び替えの候補（--reorder の判定）")
+        L.append("")
+        if not reorder_candidates:
+            L.append("候補なし")
+        else:
+            L.append(
+                "- 実行するには --reorder-apply <候補番号> を指定する。選ばない限り、ファイルは作られない"
+            )
+            for c in reorder_candidates:
+                L.append("")
+                L.append("### 候補 %d: %s" % (c["no"], CANDIDATE_KIND_JP[c["kind"]]))
+                L.append("- 現在の順序: %s" % _order_text(c["current"], c["heads"]))
+                L.append("- 候補の順序: %s" % _order_text(c["order"], c["heads"]))
+                L.append("- 根拠: %s" % c["reason"])
     L.append("")
     L.append("## 対象外・前提")
     L.append("")
@@ -1212,7 +1475,7 @@ def sha256(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="pptx の見やすさ問題をレポートする（--fix で自動調整、--split でページ分割も行う）"
+        description="pptx の見やすさ問題をレポートする（--fix で自動調整、--split でページ分割、--reorder-apply で並び替えも行う）"
     )
     ap.add_argument("pptx")
     ap.add_argument(
@@ -1221,7 +1484,7 @@ def main(argv=None):
     ap.add_argument(
         "--out",
         default=None,
-        help="Markdownの出力先（既定: カレントに <名前>_reslide_report.md、--fix 時は <名前>_reslide_changes.md）",
+        help="Markdownの出力先（既定: カレントに <名前>_reslide_report.md、--fix または --reorder-apply 時は <名前>_reslide_changes.md）",
     )
     ap.add_argument(
         "--fix",
@@ -1233,12 +1496,36 @@ def main(argv=None):
         action="store_true",
         help="詰め込みスライドの分割候補を判定する（--fix と併用すると分割も実行する）",
     )
+    ap.add_argument(
+        "--reorder",
+        action="store_true",
+        help="並び替え候補を判定してレポートに出す（自動では並び替えない）",
+    )
+    ap.add_argument(
+        "--reorder-apply",
+        type=int,
+        default=None,
+        metavar="候補番号",
+        help="--reorder で出た候補のうち、指定した番号だけを並び替えて <元名>_reslide.pptx へ保存する",
+    )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8")
         except Exception:
             pass
+    if args.reorder_apply is not None and args.split:
+        print(
+            "--reorder-apply と --split は併用できません。分割でスライドが増えると、候補番号が指す並びが変わるためです",
+            file=sys.stderr,
+        )
+        return 2
+    if args.reorder and args.fix and args.reorder_apply is None:
+        print(
+            "--reorder はレポート表示（--fix なし）で使ってください。並び替えの実行は --reorder-apply <候補番号> で指定します",
+            file=sys.stderr,
+        )
+        return 2
     src = Path(args.pptx)
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
     before = sha256(src)
@@ -1247,11 +1534,40 @@ def main(argv=None):
     slides = read_presentation(prs, resolver)
     # 分割の判定は、調整で位置やサイズが変わる前の状態に対して行う
     verdicts = judge_split(slides, cfg) if args.split else None
-    if args.fix:
-        slide_objs = list(prs.slides)
-        changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
-        if args.split:
-            changes += apply_splits(prs, slide_objs, slides, verdicts, cfg)
+    # 並び替えの判定も調整前の状態に対して行う（候補番号は入力時点の順序で決まる）
+    candidates = (
+        judge_reorder(slides, cfg)
+        if (args.reorder or args.reorder_apply is not None)
+        else None
+    )
+    chosen = None
+    if args.reorder_apply is not None:
+        if not candidates:
+            print(
+                "並び替え候補が無いため、--reorder-apply %d は実行できません"
+                % args.reorder_apply,
+                file=sys.stderr,
+            )
+            return 2
+        if not 1 <= args.reorder_apply <= len(candidates):
+            print(
+                "--reorder-apply の候補番号が範囲外です（候補は %d 件）"
+                % len(candidates),
+                file=sys.stderr,
+            )
+            return 2
+        chosen = candidates[args.reorder_apply - 1]
+    if args.fix or chosen is not None:
+        changes = []
+        if args.fix:
+            slide_objs = list(prs.slides)
+            changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
+            if args.split:
+                changes += apply_splits(prs, slide_objs, slides, verdicts, cfg)
+        if chosen is not None:
+            # 並び替えは最後に行う。--fix の調整はスライドの枚数も順序も変えないため、
+            # 候補が指す番号は sldIdLst の並びとそのまま対応する
+            changes.append(apply_reorder(prs, chosen))
         out_pptx = Path.cwd() / (src.stem + "_reslide.pptx")
         prs.save(str(out_pptx))
         report = build_changes_report(src, out_pptx.name, changes)
@@ -1266,7 +1582,9 @@ def main(argv=None):
         print("変更一覧の保存先: %s" % out.resolve())
     else:
         findings, stats = judge(slides, cfg, prs.slide_width, prs.slide_height)
-        report = build_report(src, prs, slides, findings, stats, cfg, verdicts)
+        report = build_report(
+            src, prs, slides, findings, stats, cfg, verdicts, candidates
+        )
         out = (
             Path(args.out)
             if args.out
