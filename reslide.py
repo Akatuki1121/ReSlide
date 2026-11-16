@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""ReSlide フェーズ1: .pptx を読み取り専用で走査し、見やすさの問題をレポートする。
+"""ReSlide: .pptx を走査し、見やすさの問題をレポートする（フェーズ1）。
 
 使い方: python reslide.py <対象.pptx> [--config 設定.json] [--out レポート.md]
+       python reslide.py <対象.pptx> --fix   … 自動調整（フェーズ2）
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
+--fix の結果は <元名>_reslide.pptx へ新規保存し、変更一覧を Markdown で出す。
 """
 
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from pptx import Presentation
@@ -183,21 +187,25 @@ def autofit_scale(shape):
 class TextUnit:
     """テキスト枠1つ、または表のセル1つ分のテキスト。"""
 
-    def __init__(self, label, paragraphs, scale):
+    def __init__(self, label, paragraphs, scale, inner_w=0, inner_h=0):
         self.label = label  # 例: "" / "セル(2,3)"
-        self.paragraphs = paragraphs  # [{"text","chars":[(n,size,src)]}]
+        self.paragraphs = (
+            paragraphs  # [{"text","runs":[(n,size,src)],"run_els":[(要素,文字列)]}]
+        )
         self.scale = scale
+        self.inner_w = inner_w  # 枠の内側（余白を差し引いた）幅・EMU・絶対座標
+        self.inner_h = inner_h  # 同・高さ
 
     @property
     def text(self):
         return "\n".join(p["text"] for p in self.paragraphs if p["text"].strip())
 
 
-def read_text_unit(resolver, shape, txbody, label=""):
+def read_text_unit(resolver, shape, txbody, label="", inner_w=0, inner_h=0):
     scale = autofit_scale(shape) if label == "" else 1.0
     paras = []
     for p_el in txbody.findall("a:p", NS):
-        runs, text_parts = [], []
+        runs, run_els, text_parts = [], [], []
         for child in p_el:
             if child.tag in (A + "r", A + "fld"):
                 t = child.find("a:t", NS)
@@ -205,11 +213,31 @@ def read_text_unit(resolver, shape, txbody, label=""):
                 if txt:
                     size, src = resolver.resolve(shape, p_el, child)
                     runs.append((len(txt.replace("\n", "")), size, src))
+                    run_els.append((child, txt))
                 text_parts.append(txt)
             elif child.tag == A + "br":
                 text_parts.append("\n")
-        paras.append({"text": "".join(text_parts), "runs": runs})
-    return TextUnit(label, paras, scale)
+        paras.append({"text": "".join(text_parts), "runs": runs, "run_els": run_els})
+    return TextUnit(label, paras, scale, inner_w, inner_h)
+
+
+DEFAULT_INSET_LR = 91440  # 0.1 inch（OOXML の既定の左右余白）
+DEFAULT_INSET_TB = 45720  # 0.05 inch（同・上下余白）
+
+
+def _insets(obj):
+    """text_frame / cell の内側余白 (左, 右, 上, 下) を EMU で返す。未指定は既定値。"""
+
+    def g(name, default):
+        v = getattr(obj, name, None)
+        return v if v is not None else default
+
+    return (
+        g("margin_left", DEFAULT_INSET_LR),
+        g("margin_right", DEFAULT_INSET_LR),
+        g("margin_top", DEFAULT_INSET_TB),
+        g("margin_bottom", DEFAULT_INSET_TB),
+    )
 
 
 class Elem:
@@ -219,6 +247,10 @@ class Elem:
         self.units = []
         self.ph_type = None  # PP_PLACEHOLDER 名
         self.in_group = False
+        self.shape = (
+            None  # python-pptx の要素オブジェクト（--fix で位置とサイズを触る）
+        )
+        self.tf = None  # 絶対座標への変換（グループ内要素の移動量の換算に使う）
 
     @property
     def has_text(self):
@@ -283,6 +315,8 @@ def walk(resolver, slide_no, shapes, tf, out, in_group=False):
             continue
         el = Elem(slide_no, kind, sh.name, ax, ay, aw, ah)
         el.in_group = in_group
+        el.shape = sh
+        el.tf = tf
         if sh.is_placeholder:
             try:
                 el.ph_type = sh.placeholder_format.type.name
@@ -296,14 +330,27 @@ def walk(resolver, slide_no, shapes, tf, out, in_group=False):
                         continue
                     tb = cell._tc.find("a:txBody", NS)
                     if tb is not None:
+                        il, ir, it, ib = _insets(cell)
+                        iw = (tbl.columns[ci].width - il - ir) * tf.sx
+                        ih = (tbl.rows[ri].height - it - ib) * tf.sy
                         el.units.append(
                             read_text_unit(
-                                resolver, sh, tb, "セル(%d行%d列)" % (ri + 1, ci + 1)
+                                resolver,
+                                sh,
+                                tb,
+                                "セル(%d行%d列)" % (ri + 1, ci + 1),
+                                iw,
+                                ih,
                             )
                         )
         elif sh.has_text_frame:
+            il, ir, it, ib = _insets(sh.text_frame)
+            iw = (w - il - ir) * tf.sx
+            ih = (h - it - ib) * tf.sy
             el.units.append(
-                read_text_unit(resolver, sh, sh._element.find("p:txBody", NS))
+                read_text_unit(
+                    resolver, sh, sh._element.find("p:txBody", NS), "", iw, ih
+                )
             )
         out.append(el)
 
@@ -319,7 +366,7 @@ def read_presentation(prs, resolver):
 
 # ---------------------------------------------------------------- 判定
 def classify(elem, unit, cfg):
-    """(役割, 根拠) を返す。役割: title / note / body"""
+    """(役割, 根拠) を返す。役割: title / note / label / body"""
     if elem.ph_type in cfg["title_placeholder_types"]:
         return "title", "タイトル用プレースホルダ(%s)" % elem.ph_type
     if elem.ph_type in cfg["note_placeholder_types"]:
@@ -330,7 +377,17 @@ def classify(elem, unit, cfg):
             return "note", "先頭が「%s」で始まる注記" % pre
     if first and re.match(cfg["page_number_regex"], unit.text.strip()):
         return "note", "ページ番号の書式（数字のみ／n/m）"
+    # ラベル: 表のセルでなく、1段落のみ・改行なし・短いテキスト
+    if unit.label == "":
+        texts = [p["text"] for p in unit.paragraphs if p["text"].strip()]
+        if len(texts) == 1 and "\n" not in texts[0]:
+            n = len(texts[0].strip())
+            if n <= cfg.get("label_max_chars", 30):
+                return "label", "1段落・改行なし・%d文字のためラベル" % n
     return "body", "上記に該当しないため本文"
+
+
+ROLE_JP = {"body": "本文", "label": "ラベル"}
 
 
 def judge(slides, cfg, slide_w, slide_h):
@@ -341,10 +398,10 @@ def judge(slides, cfg, slide_w, slide_h):
         "unresolved": [],
         "by_src": {},
         "notes": [],
+        "labels": [],
         "units": 0,
     }
-    floor = cfg["body_min_pt"]
-    tol = cfg["out_of_bounds_tolerance_mm"] * EMU_PER_MM
+    floors = {"body": cfg["body_min_pt"], "label": cfg.get("label_min_pt", 18)}
 
     for sno, elems in enumerate(slides, 1):
         for e in elems:
@@ -353,6 +410,7 @@ def judge(slides, cfg, slide_w, slide_h):
                     continue
                 stats["units"] += 1
                 role, why = classify(e, u, cfg)
+                floor_u = floors.get(role)
                 small_chars = total = 0
                 sizes = []
                 for p in u.paragraphs:
@@ -368,7 +426,7 @@ def judge(slides, cfg, slide_w, slide_h):
                         eff = size * u.scale
                         stats["by_src"][src] = stats["by_src"].get(src, 0) + n
                         sizes.append(eff)
-                        if role == "body" and eff < floor:
+                        if floor_u is not None and eff < floor_u:
                             small_chars += n
                 if role == "note":
                     stats["notes"].append(
@@ -381,7 +439,18 @@ def judge(slides, cfg, slide_w, slide_h):
                             u.text[:20],
                         )
                     )
-                if role == "body" and small_chars:
+                if role == "label":
+                    stats["labels"].append(
+                        (
+                            sno,
+                            e.name,
+                            u.label,
+                            why,
+                            min(sizes) if sizes else None,
+                            u.text[:20],
+                        )
+                    )
+                if floor_u is not None and small_chars:
                     scale_note = (
                         "（自動縮小 %d%% 適用後の値）" % round(u.scale * 100)
                         if u.scale != 1.0
@@ -393,15 +462,29 @@ def judge(slides, cfg, slide_w, slide_h):
                             "elem": e,
                             "label": u.label,
                             "head": u.text[:24].replace("\n", " "),
-                            "detail": "最小 %.1fpt / 本文の下限 %gpt（%d/%d文字が下限未満）%s。役割=本文（%s）"
-                            % (min(sizes), floor, small_chars, total, scale_note, why),
+                            "detail": "最小 %.1fpt / %sの下限 %gpt（%d/%d文字が下限未満）%s。役割=%s（%s）"
+                            % (
+                                min(sizes),
+                                ROLE_JP[role],
+                                floor_u,
+                                small_chars,
+                                total,
+                                scale_note,
+                                ROLE_JP[role],
+                                why,
+                            ),
                         }
                     )
 
-        # はみ出し
+        # はみ出し（許容は要素種別で分ける: 画像は広く、それ以外は従来通り）
         for e in elems:
             if e.kind == "線・コネクタ":
                 continue
+            tol = (
+                cfg.get("image_out_of_bounds_tolerance_mm", 2.0)
+                if e.kind == "図(画像)"
+                else cfg["out_of_bounds_tolerance_mm"]
+            ) * EMU_PER_MM
             over = []
             if e.x < -tol:
                 over.append("左 %.1fmm" % mm(-e.x))
@@ -441,6 +524,8 @@ def judge(slides, cfg, slide_w, slide_h):
         for i in range(len(cand)):
             for j in range(i + 1, len(cand)):
                 a, b = cand[i], cand[j]
+                if a.kind == "図(画像)" and b.kind == "図(画像)":
+                    continue  # 画像同士の重なりはレイヤーのデザインとして対象外
                 ix = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
                 iy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
                 if ix <= 0 or iy <= 0:
@@ -472,6 +557,270 @@ def judge(slides, cfg, slide_w, slide_h):
     return findings, stats
 
 
+# ---------------------------------------------------------------- 自動調整（フェーズ2）
+PT_TO_MM = 0.3528
+LINE_HEIGHT = 1.2  # 行高はフォントサイズの1.2倍として推定
+FIT_SAFETY = 0.98  # 推定を安全側に倒すため、使える内寸を少し小さく見る
+
+
+def _char_factor(ch):
+    """文字幅の近似係数（フォントサイズ比）。全角=1.0、半角=0.55。"""
+    return 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.55
+
+
+def _est_height_mm(unit, raise_to):
+    """raise_to(pt) 未満の run を raise_to まで上げた場合のテキスト推定高さ(mm)。
+
+    段落ごとに、文字幅の合計から折り返し行数を推定し、
+    行数 × 最大サイズ × 行高 で高さを積む。改行（a:br）の分は最低行数として数える。
+    """
+    inner_w = mm(unit.inner_w) * FIT_SAFETY
+    total = 0.0
+    for p in unit.paragraphs:
+        if not p["runs"]:
+            total += raise_to * LINE_HEIGHT * PT_TO_MM
+            continue
+        width_pt = 0.0
+        max_size = 0.0
+        for (n, size, src), (el, txt) in zip(p["runs"], p["run_els"]):
+            if size is None:
+                continue
+            new = max(size * unit.scale, raise_to)
+            max_size = max(max_size, new)
+            width_pt += sum(_char_factor(c) for c in txt) * new
+        if max_size == 0:
+            total += raise_to * LINE_HEIGHT * PT_TO_MM
+            continue
+        wrapped = math.ceil(width_pt * PT_TO_MM / inner_w) if inner_w > 0 else 1
+        lines = max(p["text"].count("\n") + 1, wrapped)
+        total += lines * max_size * LINE_HEIGHT * PT_TO_MM
+    return total
+
+
+def _fit_size(unit, floor):
+    """floor 以下で枠に収まる最大のサイズ(pt)。現状の最小サイズ以下なら None。"""
+    sizes = [
+        size * unit.scale
+        for p in unit.paragraphs
+        for (n, size, src) in p["runs"]
+        if size is not None
+    ]
+    if not sizes:
+        return None
+    cur_min = min(sizes)
+    if cur_min >= floor:
+        return None
+    inner_h = mm(unit.inner_h) * FIT_SAFETY
+    cand = float(floor)
+    while cand > cur_min:
+        if _est_height_mm(unit, cand) <= inner_h:
+            return cand
+        cand -= 0.5
+    return None
+
+
+def _apply_size(unit, target_eff):
+    """target_eff(pt) 未満の run に、run 単位の明示サイズを設定する。"""
+    for p in unit.paragraphs:
+        for (n, size, src), (el, txt) in zip(p["runs"], p["run_els"]):
+            if size is None:
+                continue
+            if size * unit.scale < target_eff - 1e-9:
+                raw = target_eff / unit.scale if unit.scale else target_eff
+                rpr = el.find("a:rPr", NS)
+                if rpr is None:
+                    rpr = el.makeelement(A + "rPr", {})
+                    el.insert(0, rpr)
+                rpr.set("sz", str(int(round(raw * 100))))
+
+
+def _move(e, dx, dy):
+    """要素を絶対座標で (dx, dy) EMU 動かす。グループ内はローカル座標へ換算する。"""
+    if dx:
+        e.shape.left = int(round(e.shape.left + dx / e.tf.sx))
+        e.x += dx
+    if dy:
+        e.shape.top = int(round(e.shape.top + dy / e.tf.sy))
+        e.y += dy
+
+
+def _tol_for(e, cfg):
+    """はみ出しの許容(EMU)。画像は広く、それ以外は従来通り。"""
+    return (
+        cfg.get("image_out_of_bounds_tolerance_mm", 2.0)
+        if e.kind == "図(画像)"
+        else cfg["out_of_bounds_tolerance_mm"]
+    ) * EMU_PER_MM
+
+
+def apply_fixes(slides, cfg, slide_w, slide_h):
+    """サイズ拡大・はみ出し解消・重なり解消を行い、変更の一覧を返す。"""
+    changes = []
+
+    def rec(sno, type_, e, label, detail, head=None):
+        changes.append(
+            {
+                "slide": sno,
+                "type": type_,
+                "elem": e.name,
+                "label": label,
+                "head": (head if head is not None else (e.text or e.name))[:24].replace(
+                    "\n", " "
+                ),
+                "detail": detail,
+            }
+        )
+
+    floors = {"body": cfg["body_min_pt"], "label": cfg.get("label_min_pt", 18)}
+    for sno, elems in enumerate(slides, 1):
+        # 1. サイズの拡大（note と title は触らない）
+        for e in elems:
+            for u in e.units:
+                if not u.text.strip():
+                    continue
+                role, why = classify(e, u, cfg)
+                floor = floors.get(role)
+                if floor is None:
+                    continue
+                target = _fit_size(u, floor)
+                if target is None:
+                    continue
+                old_min = min(
+                    size * u.scale
+                    for p in u.paragraphs
+                    for (n, size, s2) in p["runs"]
+                    if size is not None
+                )
+                _apply_size(u, target)
+                rec(
+                    sno,
+                    "サイズ",
+                    e,
+                    u.label,
+                    "最小 %.1fpt → %.1fpt（役割=%s、下限 %gpt。枠に収まる範囲で拡大）"
+                    % (old_min, target, ROLE_JP[role], floor),
+                    head=u.text,
+                )
+
+        # 2. はみ出しの解消（スライド範囲内へ平行移動で戻す）
+        for e in elems:
+            if e.kind == "線・コネクタ" or e.shape is None:
+                continue
+            tol = _tol_for(e, cfg)
+            dx = dy = 0.0
+            if e.x < -tol:
+                dx = -e.x
+            elif e.x + e.w > slide_w + tol:
+                dx = slide_w - (e.x + e.w)
+            if e.y < -tol:
+                dy = -e.y
+            elif e.y + e.h > slide_h + tol:
+                dy = slide_h - (e.y + e.h)
+            if dx or dy:
+                parts = []
+                if dx < 0:
+                    parts.append("左へ %.1fmm" % mm(-dx))
+                if dx > 0:
+                    parts.append("右へ %.1fmm" % mm(dx))
+                if dy < 0:
+                    parts.append("上へ %.1fmm" % mm(-dy))
+                if dy > 0:
+                    parts.append("下へ %.1fmm" % mm(dy))
+                _move(e, dx, dy)
+                rec(
+                    sno,
+                    "移動（はみ出し解消）",
+                    e,
+                    "",
+                    "スライド範囲内へ戻すため %s 移動" % "、".join(parts),
+                )
+
+        # 3. 重なりの解消（テキストを持つ要素同士。後ろの要素を下→右の順に試す）
+        cand = [e for e in elems if e.has_text and e.shape is not None]
+        for i in range(len(cand)):
+            for j in range(i + 1, len(cand)):
+                a, b = cand[i], cand[j]
+                ix = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+                iy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+                if ix <= 0 or iy <= 0:
+                    continue
+                if mm(ix) < cfg["overlap_min_mm"] or mm(iy) < cfg["overlap_min_mm"]:
+                    continue
+                small = min(a.w * a.h, b.w * b.h) or 1
+                if ix * iy / small < cfg["overlap_min_ratio"]:
+                    continue
+                pair = "「%s」と「%s」" % (
+                    (a.text or a.name)[:16].replace("\n", " "),
+                    (b.text or b.name)[:16].replace("\n", " "),
+                )
+                dy = (a.y + a.h) - b.y
+                if b.y + dy + b.h <= slide_h:
+                    _move(b, 0.0, dy)
+                    rec(
+                        sno,
+                        "移動（重なり解消）",
+                        b,
+                        "",
+                        "%s の重なりを解消するため 下へ %.1fmm 移動" % (pair, mm(dy)),
+                    )
+                    continue
+                dx = (a.x + a.w) - b.x
+                if b.x + dx + b.w <= slide_w:
+                    _move(b, dx, 0.0)
+                    rec(
+                        sno,
+                        "移動（重なり解消）",
+                        b,
+                        "",
+                        "%s の重なりを解消するため 右へ %.1fmm 移動" % (pair, mm(dx)),
+                    )
+                    continue
+                rec(
+                    sno,
+                    "未解消",
+                    b,
+                    "",
+                    "%s の重なりを、スライド内に収まる範囲では解消できなかった" % pair,
+                )
+    return changes
+
+
+def build_changes_report(path, out_name, changes):
+    L = []
+    L.append("# ReSlide 変更一覧: %s" % Path(path).name)
+    L.append("")
+    L.append("- 出力ファイル: %s" % out_name)
+    n_size = sum(1 for c in changes if c["type"] == "サイズ")
+    n_move = sum(1 for c in changes if c["type"].startswith("移動"))
+    n_fail = sum(1 for c in changes if c["type"] == "未解消")
+    L.append(
+        "- 変更の合計: %d件（サイズ %d件 / 移動 %d件 / 解消できなかった %d件）"
+        % (len(changes), n_size, n_move, n_fail)
+    )
+    if not changes:
+        L.append("")
+        L.append("変更なし")
+        return "\n".join(L) + "\n"
+    by_slide = {}
+    for c in changes:
+        by_slide.setdefault(c["slide"], []).append(c)
+    for sno in sorted(by_slide):
+        L.append("")
+        L.append("### スライド %d（%d件）" % (sno, len(by_slide[sno])))
+        for c in by_slide[sno]:
+            L.append(
+                "- [%s] %s%s 「%s」"
+                % (
+                    c["type"],
+                    c["elem"],
+                    (" " + c["label"]) if c["label"] else "",
+                    c["head"],
+                )
+            )
+            L.append("  - %s" % c["detail"])
+    return "\n".join(L) + "\n"
+
+
 # ---------------------------------------------------------------- レポート
 def build_report(path, prs, slides, findings, stats, cfg):
     L = []
@@ -481,7 +830,10 @@ def build_report(path, prs, slides, findings, stats, cfg):
         "- スライド数: %d / サイズ: %.0f x %.0f mm（単位はすべて mm、フォントは pt）"
         % (len(slides), mm(prs.slide_width), mm(prs.slide_height))
     )
-    L.append("- 基準値: 本文の下限 %gpt（設定ファイルの値）" % cfg["body_min_pt"])
+    L.append(
+        "- 基準値: 本文の下限 %gpt / ラベルの下限 %gpt（設定ファイルの値）"
+        % (cfg["body_min_pt"], cfg.get("label_min_pt", 18))
+    )
     total = sum(len(v) for v in findings.values())
     L.append("- 指摘の合計: %d 件" % total)
     L.append("")
@@ -545,6 +897,23 @@ def build_report(path, prs, slides, findings, stats, cfg):
             )
         )
     L.append("")
+    L.append("## ラベルとして本文より低い下限を当てたもの")
+    L.append("")
+    if not stats["labels"]:
+        L.append("なし")
+    for s, name, label, why, size, head in stats["labels"]:
+        L.append(
+            "- スライド%d「%s」%s 「%s」 サイズ %s / 根拠: %s"
+            % (
+                s,
+                name,
+                label,
+                head.replace("\n", " "),
+                ("%.1fpt" % size) if size else "未解決",
+                why,
+            )
+        )
+    L.append("")
     L.append("## 対象外・前提")
     L.append("")
     L.append("- グラフ・SmartArt の内部の文字は読まない（要素の位置と大きさのみ）。")
@@ -553,7 +922,7 @@ def build_report(path, prs, slides, findings, stats, cfg):
         "- 継承（レイアウト・マスター）で決まる値は、プレースホルダの対応付けが取れた範囲で解決する。表スタイル由来のサイズは見ない。"
     )
     L.append(
-        "- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線は除外）。"
+        "- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線、図(画像)同士は除外）。"
     )
     return "\n".join(L) + "\n"
 
@@ -568,7 +937,7 @@ def sha256(path):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="pptx の見やすさ問題をレポートする（読み取り専用）"
+        description="pptx の見やすさ問題をレポートする（--fix で自動調整も行う）"
     )
     ap.add_argument("pptx")
     ap.add_argument(
@@ -577,7 +946,12 @@ def main(argv=None):
     ap.add_argument(
         "--out",
         default=None,
-        help="Markdownレポートの出力先（既定: カレントに <名前>_reslide_report.md）",
+        help="Markdownの出力先（既定: カレントに <名前>_reslide_report.md、--fix 時は <名前>_reslide_changes.md）",
+    )
+    ap.add_argument(
+        "--fix",
+        action="store_true",
+        help="自動調整して <元名>_reslide.pptx を新規保存し、変更一覧を出す",
     )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
@@ -591,12 +965,31 @@ def main(argv=None):
     prs = Presentation(str(src))
     resolver = Resolver(prs)
     slides = read_presentation(prs, resolver)
-    findings, stats = judge(slides, cfg, prs.slide_width, prs.slide_height)
-    report = build_report(src, prs, slides, findings, stats, cfg)
-    out = Path(args.out) if args.out else Path.cwd() / (src.stem + "_reslide_report.md")
-    out.write_text(report, encoding="utf-8")
-    print(report)
-    print("レポート保存先: %s" % out.resolve())
+    if args.fix:
+        changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
+        out_pptx = Path.cwd() / (src.stem + "_reslide.pptx")
+        prs.save(str(out_pptx))
+        report = build_changes_report(src, out_pptx.name, changes)
+        out = (
+            Path(args.out)
+            if args.out
+            else Path.cwd() / (src.stem + "_reslide_changes.md")
+        )
+        out.write_text(report, encoding="utf-8")
+        print(report)
+        print("調整後ファイル: %s" % out_pptx.resolve())
+        print("変更一覧の保存先: %s" % out.resolve())
+    else:
+        findings, stats = judge(slides, cfg, prs.slide_width, prs.slide_height)
+        report = build_report(src, prs, slides, findings, stats, cfg)
+        out = (
+            Path(args.out)
+            if args.out
+            else Path.cwd() / (src.stem + "_reslide_report.md")
+        )
+        out.write_text(report, encoding="utf-8")
+        print(report)
+        print("レポート保存先: %s" % out.resolve())
     if sha256(src) != before:
         print("警告: 元ファイルのハッシュが変わっています", file=sys.stderr)
         return 2
