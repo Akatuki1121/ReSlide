@@ -21,6 +21,8 @@ import sys
 import unicodedata
 from pathlib import Path
 
+from lxml import etree
+
 from pptx import Presentation
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
@@ -199,6 +201,7 @@ class TextUnit:
         self.scale = scale
         self.inner_w = inner_w  # 枠の内側（余白を差し引いた）幅・EMU・絶対座標
         self.inner_h = inner_h  # 同・高さ
+        self.bg_state = None  # 自身の塗り（表のセル・図形自身）の状態。None は背景の決め方を後段に委ねる
 
     @property
     def text(self):
@@ -382,25 +385,34 @@ def walk(resolver, slide_no, shapes, tf, out, in_group=False):
                         il, ir, it, ib = _insets(cell)
                         iw = (tbl.columns[ci].width - il - ir) * tf.sx
                         ih = (tbl.rows[ri].height - it - ib) * tf.sy
-                        el.units.append(
-                            read_text_unit(
-                                resolver,
-                                sh,
-                                tb,
-                                "セル(%d行%d列)" % (ri + 1, ci + 1),
-                                iw,
-                                ih,
-                            )
+                        unit = read_text_unit(
+                            resolver,
+                            sh,
+                            tb,
+                            "セル(%d行%d列)" % (ri + 1, ci + 1),
+                            iw,
+                            ih,
                         )
+                        # セルの文字の背景は、まずセル自身の塗りで決まる
+                        try:
+                            cell_state = _fill_format_state(cell.fill)
+                        except Exception:
+                            cell_state = ("painted", None)
+                        if cell_state[0] != "none":
+                            unit.bg_state = cell_state
+                        el.units.append(unit)
         elif sh.has_text_frame:
             il, ir, it, ib = _insets(sh.text_frame)
             iw = (w - il - ir) * tf.sx
             ih = (h - it - ib) * tf.sy
-            el.units.append(
-                read_text_unit(
-                    resolver, sh, sh._element.find("p:txBody", NS), "", iw, ih
-                )
+            unit = read_text_unit(
+                resolver, sh, sh._element.find("p:txBody", NS), "", iw, ih
             )
+            # 図形自身に塗りがあれば、その文字の背景はその塗りになる
+            own_state = _fill_state(el)
+            if own_state[0] != "none":
+                unit.bg_state = own_state
+            el.units.append(unit)
         out.append(el)
 
 
@@ -542,35 +554,186 @@ def _contrast_ratio(c1, c2):
     return (hi + 0.05) / (lo + 0.05)
 
 
-def _solid_bg_color(owner):
-    """slide / layout / master の背景が単色の塗りで RGB が取れる場合だけ (r, g, b) を返す。
+def _fill_format_state(fill):
+    """塗り（FillFormat）の状態を ("rgb", 色) / ("painted", None) / ("none", None) で返す。
 
-    画像やグラデーションの背景、テーマ色の背景は対象にしない。
+    "rgb" は単色の塗りで RGB が取れたもの。"painted" は色は付いているが RGB で
+    決められないもの（グラデーション・パターン・テーマ色の単色など）。
+    "none" は塗りが無い（または透明な）もの。
     """
     try:
-        fill = owner.background.fill
-        if fill.type == MSO_FILL.SOLID and fill.fore_color.type == MSO_COLOR_TYPE.RGB:
-            rgb = fill.fore_color.rgb
-            return (int(rgb[0]), int(rgb[1]), int(rgb[2]))
+        t = fill.type
+    except Exception:
+        return ("painted", None)
+    if t == MSO_FILL.SOLID:
+        try:
+            fc = fill.fore_color
+            if fc.type == MSO_COLOR_TYPE.RGB:
+                rgb = fc.rgb
+                return ("rgb", (int(rgb[0]), int(rgb[1]), int(rgb[2])))
+        except Exception:
+            pass
+        return ("painted", None)
+    if t is None or t == MSO_FILL.BACKGROUND:
+        return ("none", None)
+    return ("painted", None)
+
+
+def _fill_state(elem):
+    """要素の塗りの状態を _fill_format_state と同じ形式で返す。
+
+    画像は中身の色が決められないため "painted"。表・グラフ・SmartArt は塗りを
+    1色で表せないため、塗りの取得に失敗したら "painted" とする。
+    """
+    if elem.kind == "図(画像)":
+        return ("painted", None)
+    if elem.shape is None:
+        return ("none", None)
+    try:
+        fill = elem.shape.fill
+    except Exception:
+        return ("painted", None)
+    return _fill_format_state(fill)
+
+
+def _theme_scheme_colors(master):
+    """マスターのテーマの色定義（clrScheme）を {名前: (r, g, b)} で返す。
+
+    srgbClr の値と、sysClr の lastClr（実際に表示される色）だけを解決する。
+    取れない色は含めない。bg1 や tx1 などの別名は、マスターの clrMap が
+    示す対応（bg1 → lt1 など）で引けるようにして返す。clrMap が無ければ
+    既定の対応を使う。
+    """
+    out = {}
+    try:
+        theme_part = None
+        for rel in master.part.rels.values():
+            if rel.reltype.endswith("/theme"):
+                theme_part = rel.target_part
+                break
+        if theme_part is None:
+            return out
+        root = etree.fromstring(theme_part.blob)
+        scheme = root.find("a:themeElements/a:clrScheme", NS)
+        if scheme is None:
+            return out
+        for child in scheme:
+            name = child.tag.rsplit("}", 1)[-1]
+            hexv = None
+            srgb = child.find("a:srgbClr", NS)
+            if srgb is not None:
+                hexv = srgb.get("val")
+            else:
+                sysc = child.find("a:sysClr", NS)
+                if sysc is not None:
+                    hexv = sysc.get("lastClr")
+            if hexv and len(hexv) == 6:
+                try:
+                    out[name] = (
+                        int(hexv[0:2], 16),
+                        int(hexv[2:4], 16),
+                        int(hexv[4:6], 16),
+                    )
+                except ValueError:
+                    pass
+        aliases = {"bg1": "lt1", "tx1": "dk1", "bg2": "lt2", "tx2": "dk2"}
+        clr_map = master._element.find("p:clrMap", NS)
+        if clr_map is not None:
+            for name in aliases:
+                if clr_map.get(name):
+                    aliases[name] = clr_map.get(name)
+        for alias, target in aliases.items():
+            if target in out:
+                out[alias] = out[target]
     except Exception:
         pass
-    return None
+    return out
+
+
+def _bg_state(owner, scheme_colors):
+    """<p:bg> を持つ持ち主（slide / layout / master）の背景の状態を返す。持たなければ None。
+
+    単色の RGB が取れれば ("rgb", 色)。背景参照（bgRef）や単色のテーマ色参照は、
+    テーマの色定義から解決できればその色。グラデーション・画像など色が
+    決められないものは ("painted", None)。
+    背景は XML から直接読む。python-pptx の background.fill に触ると、bgRef 形式の
+    背景が bgPr 形式に作り替えられてテーマ参照が消えてしまうため。
+    """
+    csld = owner._element.find("p:cSld", NS)
+    bg = csld.find("p:bg", NS) if csld is not None else None
+    if bg is None:
+        return None
+    bgpr = bg.find("p:bgPr", NS)
+    if bgpr is not None:
+        rgb = _srgb_of_props(bgpr)
+        if rgb is not None:
+            return ("rgb", rgb)
+    for path in ("p:bgRef/a:schemeClr", "p:bgPr/a:solidFill/a:schemeClr"):
+        sc = bg.find(path, NS)
+        if sc is not None and sc.get("val") in scheme_colors:
+            return ("rgb", scheme_colors[sc.get("val")])
+    return ("painted", None)
 
 
 def slide_backgrounds(prs):
-    """スライドごとの背景色 (r, g, b) のリスト。単色として取れないスライドは None。
+    """スライドごとの背景の状態 (種別, 色) のリスト。
 
-    スライド → レイアウト → マスターの順に探し、最初に取れた単色を使う。
+    背景は、定義している最初の持ち主（スライド → レイアウト → マスター）で決まる。
+    ("rgb", 色): 単色として色が決まった（テーマの色参照はテーマの定義から解決する）
+    ("painted", None): 背景はあるが色が決められない（グラデーション・画像など）
+    ("none", None): どこにも背景の定義が無い
     """
     out = []
+    scheme_cache = {}
     for slide in prs.slides:
-        color = None
-        for owner in (slide, slide.slide_layout, slide.slide_layout.slide_master):
-            color = _solid_bg_color(owner)
-            if color is not None:
+        master = slide.slide_layout.slide_master
+        key = id(master.part)
+        if key not in scheme_cache:
+            scheme_cache[key] = _theme_scheme_colors(master)
+        scheme = scheme_cache[key]
+        state = ("none", None)
+        for owner in (slide, slide.slide_layout, master):
+            st = _bg_state(owner, scheme)
+            if st is not None:
+                state = st
                 break
-        out.append(color)
+        out.append(state)
     return out
+
+
+def _effective_background(elems, idx, unit, slide_bg_state, cfg):
+    """文字ユニットの背景色 (r, g, b) を返す。色が決められなければ None（判定の対象外）。
+
+    決める順序: ユニット自身の塗り（表のセルや図形自身の単色）→ 文字の下に
+    ある図形の単色の塗り → スライドの背景 → 白（背景の定義が無い場合）。
+    画像やグラデーションなど色が決められないものが文字の背景にある場合は
+    None を返し、そのユニットは判定しない。
+    """
+    if unit.bg_state is not None:
+        kind, color = unit.bg_state
+        return color if kind == "rgb" else None
+    e = elems[idx]
+    area = e.w * e.h
+    if area > 0:
+        cover = cfg.get("contrast_cover_ratio", 0.8)
+        for j in range(idx - 1, -1, -1):
+            b = elems[j]
+            ix = min(e.x + e.w, b.x + b.w) - max(e.x, b.x)
+            iy = min(e.y + e.h, b.y + b.h) - max(e.y, b.y)
+            if ix <= 0 or iy <= 0 or ix * iy < area * cover:
+                continue
+            kind, color = _fill_state(b)
+            if kind == "rgb":
+                return color
+            if kind == "painted":
+                return None
+            # "none" の図形は塗りが無く透けるので、さらに下を探す
+    kind, color = slide_bg_state
+    if kind == "rgb":
+        return color
+    if kind == "painted":
+        return None
+    return (255, 255, 255)
 
 
 def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
@@ -591,14 +754,15 @@ def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
         body_units = []  # このスライドの本文ユニット (要素, ユニット, 最小サイズ, 根拠)
         body_pairs = []  # このスライドの本文の (サイズ, 文字数)。中央値用
         label_median = slide_body_median(elems, cfg)
-        bg = backgrounds[sno - 1] if backgrounds else None
-        for e in elems:
+        bg_state = backgrounds[sno - 1] if backgrounds else ("none", None)
+        for eidx, e in enumerate(elems):
             for u in e.units:
                 if not u.text.strip():
                     continue
                 stats["units"] += 1
                 role, why = classify(e, u, cfg, label_median)
                 floor_u = floors.get(role)
+                eff_bg = _effective_background(elems, eidx, u, bg_state, cfg)
                 small_chars = total = 0
                 sizes = []
                 contrast_worst = (
@@ -608,7 +772,7 @@ def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
                     for (n, size, src), color in zip(p["runs"], p["colors"]):
                         total += n
                         stats["chars_total"] += n
-                        if bg is not None and color is not None:
+                        if eff_bg is not None and color is not None:
                             eff_c = size * u.scale if size is not None else None
                             limit_c = (
                                 cfg.get("contrast_min_ratio_large", 3.0)
@@ -616,7 +780,7 @@ def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
                                 and eff_c >= cfg.get("contrast_large_pt", 18)
                                 else cfg.get("contrast_min_ratio", 4.5)
                             )
-                            ratio_c = _contrast_ratio(color, bg)
+                            ratio_c = _contrast_ratio(color, eff_bg)
                             if ratio_c < limit_c and (
                                 contrast_worst is None or ratio_c < contrast_worst[0]
                             ):
@@ -695,9 +859,9 @@ def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
                                 color_c[0],
                                 color_c[1],
                                 color_c[2],
-                                bg[0],
-                                bg[1],
-                                bg[2],
+                                eff_bg[0],
+                                eff_bg[1],
+                                eff_bg[2],
                                 ratio_c,
                                 limit_c,
                             ),
@@ -1814,7 +1978,7 @@ def build_report(
         "- 重なりは、テキストを持つ要素と、図・表・グラフ同士の組み合わせのみ判定（背景用の文字なし図形と線、図(画像)同士は除外）。"
     )
     L.append(
-        "- 文字色のコントラストは、文字色が明示の RGB で取れ、背景がスライド・レイアウト・マスターの単色の塗りで取れる場合だけ判定する。テーマ色や自動色の文字、画像やグラデーションの背景は対象外。"
+        "- 文字色のコントラストは、文字色が明示の RGB で取れる場合だけ判定する。背景は、文字が乗っている図形や表のセルの単色の塗りを先に探し、次にスライド・レイアウト・マスターの背景を探し、背景の定義が無ければ表示に合わせて白として判定する。背景のテーマ色参照はテーマの色定義から解決する。テーマ色や自動色の文字と、画像やグラデーションなど色が決められないものの上の文字は対象外。"
     )
     return "\n".join(L) + "\n"
 
