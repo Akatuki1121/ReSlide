@@ -31,4 +31,8 @@
 
 設計段階です。コードはこれから書きます。実装はWindowsとMacの両方で動く形を選びます。
 
-ある程度できたら、Ko-fiで寄付を受け付ける予定です。
+## 支援
+
+役に立ったら、Ko-fiでの支援が開発の励みになります。
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sousei_1121)
