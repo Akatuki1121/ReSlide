@@ -1,0 +1,88 @@
+name: Release
+
+# タグ（v*）の push で Windows 用 exe を PyInstaller でビルドし、
+# ReSlide.exe / ReSlide.bat / reslide_config.json / 使い方.txt を zip にして
+# Release に添付する。手動実行（workflow_dispatch）ではビルドと動作確認だけ
+# 行い、zip を artifact として残す（Release は作らない）。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build exe with PyInstaller
+        run: pyinstaller --onefile --name ReSlide --add-data "reslide_config.json;." reslide.py
+
+      - name: Smoke test the frozen exe
+        shell: pwsh
+        run: |
+          .\dist\ReSlide.exe --help
+          python -c "from pptx import Presentation; from pptx.util import Pt; prs = Presentation(); slide = prs.slides.add_slide(prs.slide_layouts[6]); tb = slide.shapes.add_textbox(100000, 100000, 4000000, 1000000); tf = tb.text_frame; tf.text = 'テスト'; tf.paragraphs[0].runs[0].font.size = Pt(10); prs.save('smoke.pptx')"
+          .\dist\ReSlide.exe --fix smoke.pptx
+          if (-not (Test-Path smoke_reslide.pptx)) { throw 'smoke test failed: smoke_reslide.pptx was not created' }
+          if (-not (Test-Path smoke_reslide_changes.md)) { throw 'smoke test failed: smoke_reslide_changes.md was not created' }
+          Write-Host 'smoke test passed'
+
+      - name: Stage release zip
+        id: stage
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME } else { $version = 'dev' }
+          "zip_name=ReSlide-$version.zip" >> $env:GITHUB_OUTPUT
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item dist\ReSlide.exe, ReSlide.bat, reslide_config.json, 使い方.txt release\
+          Compress-Archive -Path release\* -DestinationPath "ReSlide-$version.zip"
+          Get-ChildItem "ReSlide-$version.zip"
+
+      - name: Upload zip artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.zip_name }}
+          path: ${{ steps.stage.outputs.zip_name }}
+          if-no-files-found: error
+
+  create-release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download zip artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ReSlide-${{ github.ref_name }}.zip
+          path: dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" "dist/ReSlide-$TAG.zip" \
+            --title "ReSlide $TAG" \
+            --notes "ReSlide.exe（本体）/ ReSlide.bat（ドラッグ＆ドロップ用）/ reslide_config.json（判定の基準値の設定）/ 使い方.txt を同梱しています。zip を展開し、ReSlide.bat に .pptx をドラッグ＆ドロップしてください。exe は無署名です。Windows の SmartScreen で警告が出た時は、「詳細情報」を選んでから「実行」を押してください。"
