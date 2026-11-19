@@ -1,0 +1,11 @@
+# ローカルの作業ファイル（リポジトリには入れない）
+reslide-work/
+intro/
+readme-images/
+材料_*.pptx
+ReSlide紹介.pptx
+ReSlide紹介_reslide_report.md
+依頼文_*.md
+問い合わせ文案.md
+実測メモ.md
+__pycache__/
