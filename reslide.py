@@ -7,6 +7,8 @@
        python reslide.py <対象.pptx> --fix --split … 自動調整に加えてページ分割も行う
        python reslide.py <対象.pptx> --reorder … 並び替え候補だけをレポートする（フェーズ4）
        python reslide.py <対象.pptx> --reorder-apply <候補番号> … 選んだ候補だけ並び替えて保存する
+       python reslide.py <対象.pptx> --structure-apply <番号> … 構成の指摘を選んで修正して保存する
+       python reslide.py <対象.pptx> --gui … 構成の指摘を一覧で選んで修正するウィンドウを開く
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
 --fix の結果は <元名>_reslide.pptx へ新規保存し、変更一覧を Markdown で出す。
 """
@@ -24,8 +26,10 @@ from pathlib import Path
 from lxml import etree
 
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.util import Pt
 
 EMU_PER_MM = 36000.0
 NS = {
@@ -978,6 +982,320 @@ def judge(slides, cfg, slide_w, slide_h, backgrounds=None):
     return findings, stats
 
 
+# ---------------------------------------------------------------- 構成の指摘（指摘のみ）
+def judge_structure(slides, cfg, slide_w, slide_h):
+    """構成の指摘を返す。通常の自動調整（--fix）では直さない指摘。
+
+    judge() の findings と同じ形式で返すが、既存の「指摘の合計」には含めない
+    別枠にする（資料全体の中央値の通知と同じ扱い）。文章の意味を読む判断は
+    扱わず、形のパターンで見分けられるものだけを見る。直す場合は、レポートの
+    番号で選んで --structure-apply（または GUI）から適用する。
+    """
+    out = {i: [] for i in range(1, len(slides) + 1)}
+    for sno, elems in enumerate(slides, 1):
+        body_median = slide_body_median(elems, cfg)
+        out[sno].extend(_structure_repeats(elems, cfg, body_median))
+        out[sno].extend(_structure_orphans(elems, cfg, body_median))
+        out[sno].extend(_structure_color_mismatch(elems, cfg))
+        out[sno].extend(_structure_footnotes(elems, cfg, slide_h))
+    return out
+
+
+def _structure_numbered(structure_findings):
+    """構成の指摘に、資料全体を通した連番（1から）を付けた並びを返す。
+
+    並び順はスライド順、その中では judge_structure の検出順に固定する。
+    レポートの表示と --structure-apply / GUI の指定で、同じ番号が同じ指摘を
+    指すための物差し。
+    """
+    out = []
+    no = 0
+    for sno in sorted(structure_findings):
+        for f in structure_findings[sno]:
+            no += 1
+            out.append((no, sno, f))
+    return out
+
+
+def _norm_short_text(text):
+    """繰り返しの比較用に、前後の空白を除き、連続する空白を1つに圧縮した形にする。"""
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def _structure_repeats(elems, cfg, body_median):
+    """同じ短い文が別々の要素に繰り返し出ている箇所を返す。
+
+    「リスク」のような小見出しが、並んだ要素ごとに繰り返される形を拾う。
+    数えるのは段落単位で、同じ要素の中の重複は1回と数える。表の中と、
+    注記に分類されたユニットは対象にしない。
+    """
+    min_count = cfg.get("structure_repeat_min", 3)
+    places = {}  # 正規化した文 -> {要素の位置: (要素, ユニット)}
+    order = []
+    for eidx, e in enumerate(elems):
+        if e.kind == "表":
+            continue
+        for u in e.units:
+            if not u.text.strip():
+                continue
+            role, _why = classify(e, u, cfg, body_median)
+            if role == "note":
+                continue
+            for p in u.paragraphs:
+                t = _norm_short_text(p["text"])
+                if not 2 <= len(t) <= 30:
+                    continue
+                if re.match(cfg["page_number_regex"], t):
+                    continue
+                if not any(c.isalnum() and not c.isdigit() for c in t):
+                    continue  # 数字・記号だけのものは見出しとして扱わない
+                if t not in places:
+                    places[t] = {}
+                    order.append(t)
+                places[t].setdefault(eidx, (e, u))
+    out = []
+    for t in order:
+        found = places[t]
+        if len(found) < min_count:
+            continue
+        first_e, first_u = next(iter(found.values()))
+        names = "、".join(e.name for e, _u in found.values())
+        out.append(
+            {
+                "type": "見出しの繰り返し",
+                "elem": first_e,
+                "label": first_u.label,
+                "head": t,
+                "detail": "「%s」という短い文が、このスライドの %d 個の要素に繰り返し出ている（%s）。共通の見出しとしてまとめられないか"
+                % (t, len(found), names),
+            }
+        )
+    return out
+
+
+def _paragraph_segments(unit, para):
+    """段落を明示改行で区切った (文字, 実効サイズpt) の並びのリストを返す。
+
+    サイズが解決できない run が段落にあれば None（推定できないため）。
+    明示改行（a:br）は段落の text の中に改行として入っている。run の文字列を
+    つなげたものは text から改行を除いたものと一致するので、改行の位置は
+    text 側の区切りの長さで復元する。
+    """
+    stream = []
+    for (_n, size, _src), (_el, txt) in zip(para["runs"], para["run_els"]):
+        if size is None:
+            return None
+        eff = size * unit.scale
+        stream.extend((ch, eff) for ch in txt)
+    seg_lens = [len(s) for s in para["text"].split("\n")]
+    if sum(seg_lens) != len(stream):
+        seg_lens = [len(stream)]
+    segs = []
+    pos = 0
+    for ln in seg_lens:
+        segs.append(stream[pos : pos + ln])
+        pos += ln
+    return segs
+
+
+def _wrapped_line_counts(seg, inner_w_pt):
+    """(文字, サイズpt) の並びを inner_w_pt の幅で折り返したときの、行ごとの文字数を返す。"""
+    counts = []
+    cur_n = 0
+    cur_w = 0.0
+    for ch, size in seg:
+        w = _char_factor(ch) * size
+        if cur_n and cur_w + w > inner_w_pt:
+            counts.append(cur_n)
+            cur_n = 0
+            cur_w = 0.0
+        cur_n += 1
+        cur_w += w
+    counts.append(cur_n)
+    return counts
+
+
+def _structure_orphans(elems, cfg, body_median):
+    """折り返しの最後の行に数文字だけ残る段落を返す。
+
+    折り返しは _est_height_mm と同じ近似（文字幅の係数と FIT_SAFETY）で
+    推定する。著者が明示した改行より手前は著者の判断として見ず、
+    最後の区切りが折り返した結果だけを見る。対象は本文とラベル。
+    """
+    max_chars = cfg.get("structure_orphan_max_chars", 3)
+    min_chars = cfg.get("structure_orphan_min_chars", 12)
+    out = []
+    for e in elems:
+        for u in e.units:
+            if not u.text.strip() or u.inner_w <= 0:
+                continue
+            role, _why = classify(e, u, cfg, body_median)
+            if role not in ("body", "label"):
+                continue
+            inner_w_pt = mm(u.inner_w) * FIT_SAFETY / PT_TO_MM
+            for p in u.paragraphs:
+                segs = _paragraph_segments(u, p)
+                if segs is None:
+                    continue
+                total = sum(len(s) for s in segs)
+                if total < min_chars or not segs[-1]:
+                    continue
+                counts = _wrapped_line_counts(segs[-1], inner_w_pt)
+                if len(counts) < 2 or counts[-1] > max_chars:
+                    continue
+                seg_text = p["text"].split("\n")[-1]
+                orphan = seg_text[len(seg_text) - counts[-1] :]
+                out.append(
+                    {
+                        "type": "改行の孤立",
+                        "elem": e,
+                        "label": u.label,
+                        "head": u.text[:24].replace("\n", " "),
+                        "detail": "段落（全 %d 文字）の折り返しを推定すると、最後の行が「%s」の %d 文字だけになる"
+                        % (total, orphan, counts[-1]),
+                    }
+                )
+                break  # ユニットごとに最初の該当段落で1件
+    return out
+
+
+def _color_groups(elems, cfg):
+    """横か縦に並んだ同形の要素の組を (軸, [(要素, 色)]) で順に返す。
+
+    色の不揃いの判定と、その修正で並びの組を組み直すときの共通の物差し。
+    全員の単色塗りが RGB で決まる要素だけを候補にし、大きさと並び位置が
+    近いものを組にする。重なっている要素同士は「並んだ」とはみなさない。
+    """
+    min_n = cfg.get("structure_sibling_min", 3)
+    tol = 5.0 * EMU_PER_MM
+    cand = []
+    for e in elems:
+        if not e.has_text:
+            continue
+        kind, color = _fill_state(e)
+        if kind == "rgb":
+            cand.append((e, color))
+    seen_groups = set()
+    for axis in ("row", "col"):
+        for seed, _c in cand:
+            if axis == "row":
+                near = [(e, c) for e, c in cand if abs(e.y - seed.y) <= tol]
+            else:
+                near = [(e, c) for e, c in cand if abs(e.x - seed.x) <= tol]
+            if len(near) < min_n:
+                continue
+            ws = sorted(e.w for e, _c in near)
+            hs = sorted(e.h for e, _c in near)
+            ps = sorted((e.y if axis == "row" else e.x) for e, _c in near)
+            med_w, med_h = ws[len(ws) // 2], hs[len(hs) // 2]
+            med_p = ps[len(ps) // 2]
+            group = [
+                (e, c)
+                for e, c in near
+                if abs(e.w - med_w) <= med_w * 0.25
+                and abs(e.h - med_h) <= med_h * 0.25
+                and abs((e.y if axis == "row" else e.x) - med_p) <= tol
+            ]
+            if len(group) < min_n:
+                continue
+            key = frozenset(id(e) for e, _c in group)
+            if key in seen_groups:
+                continue
+            seen_groups.add(key)
+            overlapped = False
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    a, b = group[i][0], group[j][0]
+                    ix = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+                    iy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+                    if ix > EMU_PER_MM and iy > EMU_PER_MM:
+                        overlapped = True
+            if overlapped:
+                continue
+            yield axis, group
+
+
+def _structure_color_mismatch(elems, cfg):
+    """横か縦に並んだ同形の要素のうち、1つだけ塗りの色が違うものを返す。
+
+    全員の単色塗りが RGB で決まる場合だけを見る。全員が同じ色の場合と
+    全員ばらばらの場合は、揃えたのか意図して変えたのかを決められないので
+    対象にしない。
+    """
+    out = []
+    flagged = set()
+    for axis, group in _color_groups(elems, cfg):
+        counts = {}
+        for _e, c in group:
+            counts[c] = counts.get(c, 0) + 1
+        if len(counts) != 2:
+            continue
+        odd_color = next((c for c, n in counts.items() if n == 1), None)
+        if odd_color is None:
+            continue
+        main_color = next(c for c, n in counts.items() if n == len(group) - 1)
+        odd_e = next(e for e, c in group if c == odd_color)
+        if id(odd_e) in flagged:
+            continue
+        flagged.add(id(odd_e))
+        unit = next(
+            (u for u in odd_e.units if u.text.strip()),
+            odd_e.units[0] if odd_e.units else None,
+        )
+        out.append(
+            {
+                "type": "色の不揃い",
+                "elem": odd_e,
+                "label": unit.label if unit else "",
+                "head": odd_e.text[:24].replace("\n", " "),
+                "detail": "%sに並んだ %d 個の要素のうち、この要素だけ塗りの色が違う（この要素 #%02X%02X%02X / 他の %d 個は #%02X%02X%02X）"
+                % (
+                    "横" if axis == "row" else "縦",
+                    len(group),
+                    odd_color[0],
+                    odd_color[1],
+                    odd_color[2],
+                    len(group) - 1,
+                    main_color[0],
+                    main_color[1],
+                    main_color[2],
+                ),
+            }
+        )
+    return out
+
+
+def _structure_footnotes(elems, cfg, slide_h):
+    """スライドの下端にある、長いのに小さい文字の文を返す。役割は問わない。"""
+    ratio = cfg.get("structure_footnote_top_ratio", 0.85)
+    min_chars = cfg.get("structure_footnote_min_chars", 80)
+    floor = cfg["body_min_pt"]
+    out = []
+    for e in elems:
+        if e.y <= slide_h * ratio:
+            continue
+        for u in e.units:
+            if not u.text.strip():
+                continue
+            size = _min_size(u)
+            if size is None or size >= floor:
+                continue
+            n = sum(n for p in u.paragraphs for (n, _s, _src) in p["runs"])
+            if n < min_chars:
+                continue
+            out.append(
+                {
+                    "type": "長い注釈",
+                    "elem": e,
+                    "label": u.label,
+                    "head": u.text[:24].replace("\n", " "),
+                    "detail": "スライドの下端に、最小 %.1fpt（本文の下限 %gpt 未満）で %d 文字の文がある。この長さの文は、小さい文字のままでは読みにくい"
+                    % (size, floor, n),
+                }
+            )
+    return out
+
+
 # ---------------------------------------------------------------- 自動調整（フェーズ2）
 PT_TO_MM = 0.3528
 LINE_HEIGHT = 1.2  # 行高はフォントサイズの1.2倍として推定
@@ -1301,7 +1619,15 @@ def apply_fixes(slides, cfg, slide_w, slide_h):
     return changes
 
 
-def build_changes_report(path, out_name, changes):
+STRUCTURE_STATUS_JP = {
+    "適用": "修正した",
+    "解消済み": "すでに解消していたため対象外",
+    "未解消": "解消できなかった",
+    "対象外": "対象外",
+}
+
+
+def build_changes_report(path, out_name, changes, structure_results=None):
     L = []
     L.append("# ReSlide 変更一覧: %s" % Path(path).name)
     L.append("")
@@ -1319,7 +1645,13 @@ def build_changes_report(path, out_name, changes):
     n_reorder = sum(1 for c in changes if c["type"] == "並び替え")
     if n_reorder:
         L.append("- うち並び替え: %d件" % n_reorder)
-    if not changes:
+    if structure_results:
+        n_ok = sum(1 for r in structure_results if r["status"] == "適用")
+        L.append(
+            "- うち構成の指摘の修正: %d件を指定（修正した %d件）"
+            % (len(structure_results), n_ok)
+        )
+    if not changes and not structure_results:
         L.append("")
         L.append("変更なし")
         return "\n".join(L) + "\n"
@@ -1340,6 +1672,32 @@ def build_changes_report(path, out_name, changes):
                 )
             )
             L.append("  - %s" % c["detail"])
+    if structure_results:
+        n_ok = sum(1 for r in structure_results if r["status"] == "適用")
+        n_gone = sum(1 for r in structure_results if r["status"] == "解消済み")
+        n_fail = sum(1 for r in structure_results if r["status"] == "未解消")
+        n_na = sum(1 for r in structure_results if r["status"] == "対象外")
+        L.append("")
+        L.append("## 構成の指摘の修正（--structure-apply）")
+        L.append("")
+        L.append(
+            "- 指定 %d件: 修正した %d件 / すでに解消していた %d件 / 解消できなかった %d件 / 対象外 %d件"
+            % (len(structure_results), n_ok, n_gone, n_fail, n_na)
+        )
+        for r in structure_results:
+            L.append(
+                "- 番号%d [%s] スライド%d %s%s 「%s」"
+                % (
+                    r["no"],
+                    r["type"],
+                    r["slide"],
+                    r["elem"],
+                    (" " + r["label"]) if r["label"] else "",
+                    r["head"],
+                )
+            )
+            L.append("  - 結果: %s" % STRUCTURE_STATUS_JP[r["status"]])
+            L.append("  - %s" % r["detail"])
     return "\n".join(L) + "\n"
 
 
@@ -1828,6 +2186,721 @@ def apply_reorder(prs, candidate):
     }
 
 
+# ---------------------------------------------------------------- 構成の指摘の修正（番号で選んで適用）
+# 結果の status の値: "適用"（直した）/ "解消済み"（適用直前の再確認で条件が
+# 消えていた）/ "未解消"（試したが解消できなかった）/ "対象外"（直さない種類）
+
+
+def _structure_result(no, sno, f, status, detail):
+    """構成の指摘1件分の修正結果の記録。"""
+    return {
+        "no": no,
+        "slide": sno,
+        "type": f["type"],
+        "elem": f["elem"].name,
+        "label": f["label"],
+        "head": f["head"],
+        "status": status,
+        "detail": detail,
+    }
+
+
+def _refresh_unit_sizes(resolver, elem, unit):
+    """読み取り済みの run のサイズを、現在の XML から取り直す。
+
+    --fix や先に適用した構成の修正で run のサイズが変わっていると、読み取り
+    時のサイズのままでは再確認や修正量の計算がずれる。取り除かれた段落の
+    run は親を辿れないため、そのまま残す。
+    """
+    for p in unit.paragraphs:
+        runs = []
+        for (n, size, src), (el, _txt) in zip(p["runs"], p["run_els"]):
+            p_el = el.getparent()
+            if p_el is None:
+                runs.append((n, size, src))
+                continue
+            new_size, new_src = resolver.resolve(elem.shape, p_el, el)
+            runs.append((n, new_size, new_src))
+        p["runs"] = runs
+
+
+def apply_structure_fixes(prs, slides, cfg, selected, resolver):
+    """番号で選ばれた構成の指摘を修正し、結果の記録を番号順で返す。
+
+    selected は _structure_numbered の (番号, スライド番号, 指摘) の並び。
+    適用の直前に、その指摘の条件がまだ成り立つかをスライドごとに再確認する
+    （--fix と併用すると、サイズや位置が変わって条件が消えている場合がある）。
+    条件が消えていれば変更せず、その旨を結果に記録する。
+    """
+    slide_objs = list(prs.slides)
+    by_slide = {}
+    for no, sno, f in selected:
+        by_slide.setdefault(sno, []).append((no, f))
+    results = []
+    for sno in sorted(by_slide):
+        elems = slides[sno - 1]
+        for e in elems:
+            for u in e.units:
+                _refresh_unit_sizes(resolver, e, u)
+        median = slide_body_median(elems, cfg)
+        for no, f in sorted(by_slide[sno]):
+            results.append(
+                _apply_structure_one(
+                    slide_objs[sno - 1],
+                    sno,
+                    elems,
+                    cfg,
+                    no,
+                    f,
+                    median,
+                    prs.slide_width,
+                )
+            )
+    results.sort(key=lambda r: r["no"])
+    return results
+
+
+def _apply_structure_one(slide, sno, elems, cfg, no, f, median, slide_w):
+    """構成の指摘1件を修正する。種類ごとに処理を振り分ける。"""
+    if f["type"] == "長い注釈":
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "長い注釈は自動修正の対象外のため、変更しなかった。短くするか大きくするかは、内容を見て判断する",
+        )
+    if f["type"] == "改行の孤立":
+        return _apply_structure_orphan(sno, elems, cfg, no, f, median, slide_w)
+    if f["type"] == "色の不揃い":
+        return _apply_structure_color(sno, elems, cfg, no, f)
+    if f["type"] == "見出しの繰り返し":
+        return _apply_structure_repeat(slide, sno, elems, cfg, no, f, median)
+    return _structure_result(
+        no,
+        sno,
+        f,
+        "対象外",
+        "この種類の指摘は自動修正に対応していないため、変更しなかった",
+    )
+
+
+def _orphan_paragraph(elem, cfg, median, label):
+    """要素の中で、改行の孤立が起きている最初の (ユニット, 段落) を返す。無ければ None。
+
+    判定（_structure_orphans）と同じ物差しで探す。対象は本文とラベルで、
+    ラベル（表のセルなど）が指定された場合はそのユニットだけを見る。
+    """
+    max_chars = cfg.get("structure_orphan_max_chars", 3)
+    min_chars = cfg.get("structure_orphan_min_chars", 12)
+    for u in elem.units:
+        if label and u.label != label:
+            continue
+        if not u.text.strip() or u.inner_w <= 0:
+            continue
+        role, _why = classify(elem, u, cfg, median)
+        if role not in ("body", "label"):
+            continue
+        inner_w_pt = mm(u.inner_w) * FIT_SAFETY / PT_TO_MM
+        for p in u.paragraphs:
+            segs = _paragraph_segments(u, p)
+            if segs is None:
+                continue
+            total = sum(len(s) for s in segs)
+            if total < min_chars or not segs[-1]:
+                continue
+            counts = _wrapped_line_counts(segs[-1], inner_w_pt)
+            if len(counts) >= 2 and counts[-1] <= max_chars:
+                return u, p
+    return None
+
+
+def _orphan_resolved_at(seg_sizes, inner_w_pt, cfg):
+    """最後の区切りを seg_sizes（(文字, サイズ) の並び）で折り返したとき、孤立しないかを返す。"""
+    max_chars = cfg.get("structure_orphan_max_chars", 3)
+    if not seg_sizes:
+        return False
+    counts = _wrapped_line_counts(seg_sizes, inner_w_pt)
+    return len(counts) < 2 or counts[-1] > max_chars
+
+
+def _widen_for_orphan(elems, e, unit, para, cfg, slide_w):
+    """要素の幅を右へ広げて孤立を解消する。広げた後の幅(EMU)を返す。無理なら None。
+
+    スライドの右端を超えず、元の幅に上限倍率を掛けた範囲まで、0.5mm 刻みで
+    解消する最小の幅を探す。重なりの回避対象は、判定（judge）の重なりが
+    数える相手と同じ範囲（テキストを持つ要素と、図(画像)・表・グラフ・
+    SmartArt。線・コネクタは除く）で、新たに重ならない範囲に限る。
+    表のセルは、要素の幅を広げてもセルの幅が変わらないため対象にしない。
+    """
+    if unit.label or e.shape is None or unit.inner_w <= 0:
+        return None
+    segs = _paragraph_segments(unit, para)
+    if segs is None or not segs[-1]:
+        return None
+    max_ratio = cfg.get("structure_orphan_widen_max_ratio", 1.3)
+    insets = e.w - unit.inner_w
+    max_w = min(e.w * max_ratio, slide_w - e.x)
+    if max_w <= e.w:
+        return None
+    others = [
+        o
+        for o in elems
+        if o is not e
+        and o.kind != "線・コネクタ"
+        and (o.has_text or o.kind in ("図(画像)", "表", "グラフ", "SmartArt"))
+    ]
+    step = 0.5 * EMU_PER_MM
+    new_w = e.w + step
+    while new_w <= max_w + 1e-6:
+        inner_pt = mm(new_w - insets) * FIT_SAFETY / PT_TO_MM
+        if _orphan_resolved_at(segs[-1], inner_pt, cfg) and not _widen_overlaps(
+            e, new_w, others
+        ):
+            delta = new_w - e.w
+            e.shape.width = int(round(e.shape.width + delta / e.tf.sx))
+            e.w = new_w
+            unit.inner_w += delta
+            return new_w
+        new_w += step
+    return None
+
+
+def _widen_overlaps(e, new_w, others):
+    """幅を new_w に広げたとき、others のいずれかと新たに重なるかを返す。"""
+    for o in others:
+        iy = min(e.y + e.h, o.y + o.h) - max(e.y, o.y)
+        if iy <= 0:
+            continue
+        old_area = max(min(e.x + e.w, o.x + o.w) - max(e.x, o.x), 0) * iy
+        new_area = max(min(e.x + new_w, o.x + o.w) - max(e.x, o.x), 0) * iy
+        if new_area > old_area + 1e-6:
+            return True
+    return False
+
+
+def _shrink_paragraph(unit, para, ratio):
+    """段落内の run のサイズを比率で下げる（_apply_size の縮小版）。"""
+    runs = []
+    for (n, size, src), (el, _txt) in zip(para["runs"], para["run_els"]):
+        if size is None:
+            runs.append((n, size, src))
+            continue
+        raw = size * ratio
+        rpr = el.find("a:rPr", NS)
+        if rpr is None:
+            rpr = el.makeelement(A + "rPr", {})
+            el.insert(0, rpr)
+        rpr.set("sz", str(int(round(raw * 100))))
+        runs.append((n, raw, src))
+    para["runs"] = runs
+
+
+def _shrink_for_orphan(unit, para, cfg):
+    """段落の文字を小さくして孤立を解消する。(元の最大サイズ, 変更後のサイズ) を返す。
+
+    下げ幅は、段落の最後の区切りの最大サイズから 0.5pt 刻みで探す。下限は
+    「最大で structure_orphan_shrink_max_pt pt まで下げる」と「元の9割まで」
+    のうち大きい方。段落全体の run を同じ比率で下げる。
+    """
+    segs = _paragraph_segments(unit, para)
+    if segs is None or not segs[-1]:
+        return None
+    rep = max(size for _ch, size in segs[-1])
+    floor = max(rep - cfg.get("structure_orphan_shrink_max_pt", 2), rep * 0.9)
+    inner_w_pt = mm(unit.inner_w) * FIT_SAFETY / PT_TO_MM
+    target = rep - 0.5
+    while target >= floor - 1e-9:
+        ratio = target / rep
+        scaled = [(ch, size * ratio) for ch, size in segs[-1]]
+        if _orphan_resolved_at(scaled, inner_w_pt, cfg):
+            _shrink_paragraph(unit, para, ratio)
+            return rep, target
+        target -= 0.5
+    return None
+
+
+def _apply_structure_orphan(sno, elems, cfg, no, f, median, slide_w):
+    """改行の孤立を、幅の拡大→文字の縮小の順に試して解消する。"""
+    e = f["elem"]
+    still = any(
+        f2["elem"] is e and f2["label"] == f["label"]
+        for f2 in _structure_orphans(elems, cfg, median)
+    )
+    target = _orphan_paragraph(e, cfg, median, f["label"]) if still else None
+    if target is None:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "解消済み",
+            "適用の直前に再確認したところ、孤立はすでに解消していたため変更しなかった",
+        )
+    unit, para = target
+    old_w = e.w
+    new_w = _widen_for_orphan(elems, e, unit, para, cfg, slide_w)
+    if new_w is not None:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "適用",
+            "要素の幅を %.1fmm から %.1fmm へ広げて、最後の行の孤立を解消した"
+            % (mm(old_w), mm(new_w)),
+        )
+    shrunk = _shrink_for_orphan(unit, para, cfg)
+    if shrunk is not None:
+        rep, target_size = shrunk
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "適用",
+            "段落の文字を %.1fpt から %.1fpt へ小さくして、最後の行の孤立を解消した"
+            % (rep, target_size),
+        )
+    return _structure_result(
+        no,
+        sno,
+        f,
+        "未解消",
+        "幅の拡大（元の幅の最大 %g 倍まで・他の要素と新たに重ならない範囲）でも、文字の縮小（最大 %gpt・元の9割まで）でも、孤立を解消できなかった"
+        % (
+            cfg.get("structure_orphan_widen_max_ratio", 1.3),
+            cfg.get("structure_orphan_shrink_max_pt", 2),
+        ),
+    )
+
+
+def _color_majority_for(elems, cfg, target):
+    """target を含む並びの組で、target 以外が共有する塗りの色を返す。無ければ None。
+
+    判定（_structure_color_mismatch）と同じ物差し（_color_groups）で組を
+    作り直し、target が1つだけ違う側にいる組を探す。
+    """
+    for _axis, group in _color_groups(elems, cfg):
+        if not any(e is target for e, _c in group):
+            continue
+        others = [c for e, c in group if e is not target]
+        target_color = next(c for e, c in group if e is target)
+        if others and len(set(others)) == 1 and others[0] != target_color:
+            return others[0]
+    return None
+
+
+def _apply_structure_color(sno, elems, cfg, no, f):
+    """色の不揃いを、並んだ他の要素と同じ色に合わせて直す。"""
+    e = f["elem"]
+    still = any(f2["elem"] is e for f2 in _structure_color_mismatch(elems, cfg))
+    if not still:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "解消済み",
+            "適用の直前に再確認したところ、色の不揃いはすでに解消していたため変更しなかった",
+        )
+    main_color = _color_majority_for(elems, cfg, e)
+    if main_color is None:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "並びの組を確認できなかったため、変更しなかった",
+        )
+    if e.shape is None or e.kind in (
+        "表",
+        "グラフ",
+        "SmartArt",
+        "図(画像)",
+        "線・コネクタ",
+    ):
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "この要素は塗りを単色で設定できないため、変更しなかった",
+        )
+    _kind, old_color = _fill_state(e)
+    if old_color is None:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "現在の塗りの色を確認できなかったため、変更しなかった",
+        )
+    try:
+        e.shape.fill.solid()
+        e.shape.fill.fore_color.rgb = RGBColor(*main_color)
+    except Exception:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "この要素は塗りを単色で設定できなかったため、変更しなかった",
+        )
+    return _structure_result(
+        no,
+        sno,
+        f,
+        "適用",
+        "塗りの色を #%02X%02X%02X から、並んだ他の要素と同じ #%02X%02X%02X に合わせた"
+        % (
+            old_color[0],
+            old_color[1],
+            old_color[2],
+            main_color[0],
+            main_color[1],
+            main_color[2],
+        ),
+    )
+
+
+def _live_paragraphs(elem):
+    """要素のテキスト枠の段落を、実 XML の (a:p, 正規化したテキスト) で返す。
+
+    読み取り済みの段落は、先に適用した修正でずれている場合があるため、
+    取り除く対象は実 XML で数え直す。テキスト枠が取れなければ None。
+    """
+    if elem.shape is None:
+        return None
+    txbody = elem.shape._element.find("p:txBody", NS)
+    if txbody is None:
+        return None
+    out = []
+    for p_el in txbody.findall("a:p", NS):
+        text = "".join(t.text or "" for t in p_el.iter(A + "t"))
+        out.append((p_el, _norm_short_text(text)))
+    return out
+
+
+def _apply_structure_repeat(slide, sno, elems, cfg, no, f, median):
+    """見出しの繰り返しを、各要素から段落を取り除き、共通の見出しを1つ作って直す。
+
+    取り除くのは、その文と一致する独立した段落だけ。共通の見出しの配置先が
+    確保できない場合は、段落を取り除かずに対象外とする（配置できることを
+    確認してから取り除く順序にする）。
+    """
+    t = f["head"]
+    still = any(f2["head"] == t for f2 in _structure_repeats(elems, cfg, median))
+    if not still:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "解消済み",
+            "適用の直前に再確認したところ、繰り返しはすでに解消していたため変更しなかった",
+        )
+    min_count = cfg.get("structure_repeat_min", 3)
+    # 対象の要素: 注記でないユニットに、その文と一致する段落を持つもの
+    targets = []  # (要素, 実XMLの段落一覧, 取り除く a:p, 段落の最大サイズ)
+    for e in elems:
+        if e.kind == "表":
+            continue
+        has_para = False
+        max_size = None
+        for u in e.units:
+            if not u.text.strip():
+                continue
+            role, _why = classify(e, u, cfg, median)
+            if role == "note":
+                continue
+            for p in u.paragraphs:
+                if _norm_short_text(p["text"]) != t:
+                    continue
+                has_para = True
+                for _n, size, _src in p["runs"]:
+                    if size is not None:
+                        eff = size * u.scale
+                        max_size = eff if max_size is None else max(max_size, eff)
+        if not has_para:
+            continue
+        live = _live_paragraphs(e)
+        if live is None:
+            continue
+        matched = [p_el for p_el, text in live if text == t]
+        if not matched:
+            continue
+        targets.append((e, live, matched, max_size))
+    if len(targets) < min_count:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "取り除ける段落を持つ要素が %d 個しか確認できなかったため、変更しなかった"
+            % len(targets),
+        )
+    # 共通の見出しの配置先を、段落を取り除く前に確認する
+    sizes = [ms for _e, _l, _m, ms in targets if ms is not None]
+    size_pt = max(sizes) if sizes else float(cfg.get("label_min_pt", 18))
+    head_h = int(size_pt * LINE_HEIGHT * PT_TO_MM * EMU_PER_MM) + DEFAULT_INSET_TB * 2
+    gap = 2.0 * EMU_PER_MM
+    min_x = min(e.x for e, _l, _m, _s in targets)
+    min_y = min(e.y for e, _l, _m, _s in targets)
+    max_r = max(e.x + e.w for e, _l, _m, _s in targets)
+    top = min_y - gap - head_h
+    if top < 0:
+        return _structure_result(
+            no,
+            sno,
+            f,
+            "対象外",
+            "共通の見出しを置く余白がスライドの上端に無いため、段落は取り除かず変更しなかった",
+        )
+    target_ids = {id(e) for e, _l, _m, _s in targets}
+    for o in elems:
+        if id(o) in target_ids or not o.has_text:
+            continue
+        ix = min(max_r, o.x + o.w) - max(min_x, o.x)
+        iy = min(top + head_h, o.y + o.h) - max(top, o.y)
+        if ix > EMU_PER_MM and iy > EMU_PER_MM:
+            return _structure_result(
+                no,
+                sno,
+                f,
+                "対象外",
+                "共通の見出しの配置先に他の要素（「%s」）が重なるため、段落は取り除かず変更しなかった"
+                % (o.text[:16].replace("\n", " ")),
+            )
+    # 段落を取り除く。テキスト枠の唯一の段落なら、段落は残して中身だけ空にする
+    for _e, live, matched, _s in targets:
+        if len(live) - len(matched) == 0:
+            for p_el in matched:
+                for child in list(p_el):
+                    if child.tag in (A + "r", A + "fld", A + "br"):
+                        p_el.remove(child)
+        else:
+            for p_el in matched:
+                p_el.getparent().remove(p_el)
+    # 共通の見出しを作る
+    txbox = slide.shapes.add_textbox(int(min_x), int(top), int(max_r - min_x), head_h)
+    tf = txbox.text_frame
+    tf.word_wrap = True
+    tf.margin_left = DEFAULT_INSET_LR
+    tf.margin_right = DEFAULT_INSET_LR
+    tf.margin_top = DEFAULT_INSET_TB
+    tf.margin_bottom = DEFAULT_INSET_TB
+    run = tf.paragraphs[0].add_run()
+    run.text = t
+    run.font.size = Pt(size_pt)
+    return _structure_result(
+        no,
+        sno,
+        f,
+        "適用",
+        "「%s」の段落を %d 個の要素から取り除き、共通の見出しを1つ作って組の上に置いた（文字の大きさ %.1fpt）"
+        % (t, len(targets), size_pt),
+    )
+
+
+# ---------------------------------------------------------------- GUI（--gui）
+def build_structure_rows(structure_findings):
+    """GUI の一覧に表示する行データを、レポートと同じ番号・順序で返す。
+
+    修正できるか（fixable）は種類で決まる。長い注釈は自動修正の対象外。
+    """
+    rows = []
+    for no, sno, f in _structure_numbered(structure_findings):
+        rows.append(
+            {
+                "no": no,
+                "slide": sno,
+                "type": f["type"],
+                "head": f["head"],
+                "detail": f["detail"],
+                "fixable": f["type"] != "長い注釈",
+            }
+        )
+    return rows
+
+
+def apply_gui_selection(
+    prs, slides, cfg, resolver, structure_findings, checked_numbers, do_fix
+):
+    """GUI で選ばれた構成の指摘を修正する。(変更一覧, 構成の修正結果) を返す。
+
+    CLI の --structure-apply と同じ順序で、自動調整（任意）を先に行い、
+    その後にチェックされた構成の修正を適用する。修正の中身は
+    apply_structure_fixes を CLI と共有する。
+    """
+    changes = []
+    if do_fix:
+        changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
+    wanted = set(checked_numbers)
+    selected = [
+        item for item in _structure_numbered(structure_findings) if item[0] in wanted
+    ]
+    results = (
+        apply_structure_fixes(prs, slides, cfg, selected, resolver) if selected else []
+    )
+    return changes, results
+
+
+def save_gui_result(src, prs, changes, structure_results):
+    """GUI の保存先。元のファイルと同じフォルダへ _reslide.pptx と変更一覧を書く。"""
+    out_pptx = src.with_name(src.stem + "_reslide.pptx")
+    prs.save(str(out_pptx))
+    report = build_changes_report(src, out_pptx.name, changes, structure_results)
+    out_md = src.with_name(src.stem + "_reslide_changes.md")
+    out_md.write_text(report, encoding="utf-8")
+    return out_pptx, out_md
+
+
+def structure_results_summary(results):
+    """構成の修正結果の要約（件数と1件ごとの結果）をテキストで返す。GUI の表示用。"""
+    if not results:
+        return "構成の指摘の修正: 指定なし"
+    n_ok = sum(1 for r in results if r["status"] == "適用")
+    n_gone = sum(1 for r in results if r["status"] == "解消済み")
+    n_fail = sum(1 for r in results if r["status"] == "未解消")
+    n_na = sum(1 for r in results if r["status"] == "対象外")
+    L = [
+        "構成の指摘の修正: %d件を指定（修正した %d件 / すでに解消していた %d件 / 解消できなかった %d件 / 対象外 %d件）"
+        % (len(results), n_ok, n_gone, n_fail, n_na)
+    ]
+    for r in results:
+        L.append(
+            "- 番号%d [%s] スライド%d: %s"
+            % (r["no"], r["type"], r["slide"], r["detail"])
+        )
+    return "\n".join(L)
+
+
+def run_gui(src, prs, slides, cfg, resolver):
+    """構成の指摘を一覧で見て、選んで修正するウィンドウを開く。
+
+    tkinter の import はこの関数の中だけに閉じる（表示環境が無い場所でも
+    CLI が壊れないように）。一覧データの組み立てと適用処理は、表示なしで
+    テストできる関数（build_structure_rows / apply_gui_selection）に分けてある。
+    """
+    import tkinter as tk
+
+    structure_findings = judge_structure(slides, cfg, prs.slide_width, prs.slide_height)
+    rows = build_structure_rows(structure_findings)
+
+    root = tk.Tk()
+    root.title("ReSlide - %s" % src.name)
+    root.geometry("900x680")
+
+    tk.Label(root, text="対象ファイル: %s" % src.name, anchor="w").pack(
+        fill="x", padx=10, pady=(10, 2)
+    )
+    tk.Label(
+        root,
+        text="構成の指摘 %d件。直したいものにチェックを入れてください。" % len(rows),
+        anchor="w",
+    ).pack(fill="x", padx=10, pady=(0, 6))
+
+    outer = tk.Frame(root)
+    outer.pack(fill="both", expand=True, padx=10)
+    canvas = tk.Canvas(outer)
+    scrollbar = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    inner = tk.Frame(canvas)
+    inner.bind(
+        "<Configure>", lambda _ev: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    check_vars = []
+    for row in rows:
+        var = tk.BooleanVar(value=False)
+        check_vars.append(var)
+        frame = tk.Frame(inner)
+        frame.pack(fill="x", anchor="w", pady=2)
+        label = "番号%d スライド%d [%s] 「%s」" % (
+            row["no"],
+            row["slide"],
+            row["type"],
+            row["head"],
+        )
+        if row["fixable"]:
+            cb = tk.Checkbutton(frame, text=label, variable=var, anchor="w")
+        else:
+            cb = tk.Checkbutton(
+                frame,
+                text=label + "（自動修正の対象外）",
+                variable=var,
+                state="disabled",
+                anchor="w",
+            )
+        cb.pack(fill="x", anchor="w")
+        tk.Label(
+            frame,
+            text=row["detail"],
+            wraplength=840,
+            justify="left",
+            anchor="w",
+            fg="#444444",
+        ).pack(fill="x", padx=(24, 0), anchor="w")
+    if not rows:
+        tk.Label(inner, text="構成の指摘はありません。", anchor="w").pack(fill="x")
+
+    fix_var = tk.BooleanVar(value=True)
+    fix_check = tk.Checkbutton(
+        root, text="文字の大きさや配置の自動調整も一緒に行う", variable=fix_var
+    )
+    fix_check.pack(anchor="w", padx=10, pady=(8, 0))
+
+    result_text = tk.Text(root, height=9, wrap="word")
+    result_text.pack(fill="x", padx=10, pady=8)
+    result_text.insert("1.0", "まだ保存していません。")
+    result_text.configure(state="disabled")
+
+    def show_result(text):
+        result_text.configure(state="normal")
+        result_text.delete("1.0", "end")
+        result_text.insert("1.0", text)
+        result_text.configure(state="disabled")
+
+    def on_apply():
+        checked = [row["no"] for row, var in zip(rows, check_vars) if var.get()]
+        if not checked and not fix_var.get():
+            show_result("修正する指摘が選ばれていません。")
+            return
+        changes, results = apply_gui_selection(
+            prs,
+            slides,
+            cfg,
+            resolver,
+            structure_findings,
+            checked,
+            fix_var.get(),
+        )
+        out_pptx, out_md = save_gui_result(src, prs, changes, results)
+        show_result(
+            "\n".join(
+                [
+                    "保存しました。",
+                    "保存先: %s" % out_pptx,
+                    "変更一覧: %s" % out_md,
+                    "自動調整の変更: %d件" % len(changes),
+                    structure_results_summary(results),
+                ]
+            )
+        )
+        apply_button.configure(state="disabled")
+        fix_check.configure(state="disabled")
+
+    buttons = tk.Frame(root)
+    buttons.pack(fill="x", padx=10, pady=(0, 10))
+    apply_button = tk.Button(
+        buttons, text="選択した指摘を修正して保存", command=on_apply
+    )
+    apply_button.pack(side="left")
+    tk.Button(buttons, text="閉じる", command=root.destroy).pack(side="left", padx=8)
+
+    root.mainloop()
+    return 0
+
+
 CANDIDATE_KIND_JP = {
     "title": "タイトルだけのスライドを、その内容の前へ出す",
     "toc": "目次の並びに合わせて入れ替える",
@@ -1844,6 +2917,7 @@ def build_report(
     cfg,
     split_verdicts=None,
     reorder_candidates=None,
+    structure_findings=None,
 ):
     L = []
     L.append("# ReSlide レポート: %s" % Path(path).name)
@@ -1904,6 +2978,44 @@ def build_report(
                 % (e.name, mm(e.x), mm(e.y), mm(e.w), mm(e.h))
             )
             L.append("  - %s" % f["detail"])
+    if structure_findings is not None:
+        L.append("")
+        L.append("## 構成の指摘（番号で選んで修正できる）")
+        L.append("")
+        s_total = sum(len(v) for v in structure_findings.values())
+        L.append("- 合計: %d 件" % s_total)
+        if not s_total:
+            L.append("")
+            L.append("なし")
+        else:
+            L.append(
+                "- 修正するには --structure-apply に番号を指定する（カンマ区切りで複数可。例: --structure-apply 1,3）。長い注釈は自動修正の対象外"
+            )
+        numbered = {
+            id(f): no for no, _sno, f in _structure_numbered(structure_findings)
+        }
+        for sno in range(1, len(slides) + 1):
+            if not structure_findings[sno]:
+                continue
+            L.append("")
+            L.append("### スライド %d" % sno)
+            for f in structure_findings[sno]:
+                e = f["elem"]
+                L.append(
+                    "- 番号%d [%s] %s%s 「%s」"
+                    % (
+                        numbered[id(f)],
+                        f["type"],
+                        e.kind,
+                        (" " + f["label"]) if f["label"] else "",
+                        f["head"],
+                    )
+                )
+                L.append(
+                    "  - 要素: %s / 位置(%.1f, %.1f)mm 大きさ %.1fx%.1fmm"
+                    % (e.name, mm(e.x), mm(e.y), mm(e.w), mm(e.h))
+                )
+                L.append("  - %s" % f["detail"])
     L.append("")
     L.append("## 注記類として本文の下限を当てなかったもの")
     L.append("")
@@ -1980,6 +3092,10 @@ def build_report(
     L.append(
         "- 文字色のコントラストは、文字色が明示の RGB で取れる場合だけ判定する。背景は、文字が乗っている図形や表のセルの単色の塗りを先に探し、次にスライド・レイアウト・マスターの背景を探し、背景の定義が無ければ表示に合わせて白として判定する。背景のテーマ色参照はテーマの色定義から解決する。テーマ色や自動色の文字と、画像やグラデーションなど色が決められないものの上の文字は対象外。"
     )
+    if structure_findings is not None:
+        L.append(
+            "- 構成の指摘（見出しの繰り返し・改行の孤立・色の不揃い・長い注釈）は、形のパターンで見分けたもの。通常の自動調整（--fix）では直さず、--structure-apply で番号を指定したものだけを修正する。長い注釈は自動修正の対象外。改行の孤立は文字幅の近似による推定で、実際の折り返しとずれる場合がある。"
+        )
     return "\n".join(L) + "\n"
 
 
@@ -2026,15 +3142,53 @@ def main(argv=None):
         metavar="候補番号",
         help="--reorder で出た候補のうち、指定した番号だけを並び替えて <元名>_reslide.pptx へ保存する",
     )
+    ap.add_argument(
+        "--structure-apply",
+        type=str,
+        default=None,
+        metavar="番号",
+        help="レポートの構成の指摘のうち、指定した番号（カンマ区切り）だけを修正して <元名>_reslide.pptx へ保存する",
+    )
+    ap.add_argument(
+        "--gui",
+        action="store_true",
+        help="構成の指摘を一覧で見て選んで修正するウィンドウを開く",
+    )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8")
         except Exception:
             pass
+    structure_nums = None
+    if args.structure_apply is not None:
+        try:
+            structure_nums = sorted(
+                {int(x) for x in args.structure_apply.split(",") if x.strip()}
+            )
+        except ValueError:
+            structure_nums = []
+        if not structure_nums:
+            print(
+                "--structure-apply の番号の指定が正しくありません（例: --structure-apply 1,3）",
+                file=sys.stderr,
+            )
+            return 2
     if args.reorder_apply is not None and args.split:
         print(
             "--reorder-apply と --split は併用できません。分割でスライドが増えると、候補番号が指す並びが変わるためです",
+            file=sys.stderr,
+        )
+        return 2
+    if structure_nums is not None and args.split:
+        print(
+            "--structure-apply と --split は併用できません。分割でスライドが増えると、番号が指す指摘が変わるためです",
+            file=sys.stderr,
+        )
+        return 2
+    if structure_nums is not None and args.reorder_apply is not None:
+        print(
+            "--structure-apply と --reorder-apply は併用できません",
             file=sys.stderr,
         )
         return 2
@@ -2050,6 +3204,8 @@ def main(argv=None):
     prs = Presentation(str(src))
     resolver = Resolver(prs)
     slides = read_presentation(prs, resolver)
+    if args.gui:
+        return run_gui(src, prs, slides, cfg, resolver)
     # 分割の判定は、調整で位置やサイズが変わる前の状態に対して行う
     verdicts = judge_split(slides, cfg) if args.split else None
     # 並び替えの判定も調整前の状態に対して行う（候補番号は入力時点の順序で決まる）
@@ -2075,20 +3231,51 @@ def main(argv=None):
             )
             return 2
         chosen = candidates[args.reorder_apply - 1]
-    if args.fix or chosen is not None:
+    # 構成の指摘の番号は、調整前の状態に対して決める（レポートの番号と一致させる）
+    structure_findings = None
+    structure_selected = []
+    if structure_nums is not None:
+        structure_findings = judge_structure(
+            slides, cfg, prs.slide_width, prs.slide_height
+        )
+        numbered = _structure_numbered(structure_findings)
+        if not numbered:
+            print(
+                "構成の指摘が無いため、--structure-apply は実行できません",
+                file=sys.stderr,
+            )
+            return 2
+        for n in structure_nums:
+            if not 1 <= n <= len(numbered):
+                print(
+                    "--structure-apply の番号が範囲外です（構成の指摘は %d 件）"
+                    % len(numbered),
+                    file=sys.stderr,
+                )
+                return 2
+        wanted = set(structure_nums)
+        structure_selected = [item for item in numbered if item[0] in wanted]
+    if args.fix or chosen is not None or structure_selected:
         changes = []
+        structure_results = None
         if args.fix:
             slide_objs = list(prs.slides)
             changes = apply_fixes(slides, cfg, prs.slide_width, prs.slide_height)
             if args.split:
                 changes += apply_splits(prs, slide_objs, slides, verdicts, cfg)
+        if structure_selected:
+            # 構成の修正は自動調整の後に行う。適用直前に条件を再確認するため、
+            # --fix で状態が変わった指摘は対象外として記録される
+            structure_results = apply_structure_fixes(
+                prs, slides, cfg, structure_selected, resolver
+            )
         if chosen is not None:
             # 並び替えは最後に行う。--fix の調整はスライドの枚数も順序も変えないため、
             # 候補が指す番号は sldIdLst の並びとそのまま対応する
             changes.append(apply_reorder(prs, chosen))
         out_pptx = Path.cwd() / (src.stem + "_reslide.pptx")
         prs.save(str(out_pptx))
-        report = build_changes_report(src, out_pptx.name, changes)
+        report = build_changes_report(src, out_pptx.name, changes, structure_results)
         out = (
             Path(args.out)
             if args.out
@@ -2102,8 +3289,20 @@ def main(argv=None):
         findings, stats = judge(
             slides, cfg, prs.slide_width, prs.slide_height, slide_backgrounds(prs)
         )
+        if structure_findings is None:
+            structure_findings = judge_structure(
+                slides, cfg, prs.slide_width, prs.slide_height
+            )
         report = build_report(
-            src, prs, slides, findings, stats, cfg, verdicts, candidates
+            src,
+            prs,
+            slides,
+            findings,
+            stats,
+            cfg,
+            verdicts,
+            candidates,
+            structure_findings,
         )
         out = (
             Path(args.out)
