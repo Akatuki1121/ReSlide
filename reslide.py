@@ -9,6 +9,7 @@
        python reslide.py <対象.pptx> --reorder-apply <候補番号> … 選んだ候補だけ並び替えて保存する
        python reslide.py <対象.pptx> --structure-apply <番号> … 構成の指摘を選んで修正して保存する
        python reslide.py <対象.pptx> --gui … 構成の指摘を一覧で選んで修正するウィンドウを開く
+       python reslide.py <対象.pptx> --check-update … 新しいバージョンがあるかだけを確認する
 元の .pptx は一切変更しない（開くだけで保存はしない。実行前後のハッシュも照合する）。
 --fix の結果は <元名>_reslide.pptx へ新規保存し、変更一覧を Markdown で出す。
 """
@@ -18,9 +19,15 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
 import sys
+import tempfile
+import threading
 import unicodedata
+import urllib.error
+import urllib.request
+import webbrowser
 from pathlib import Path
 
 from lxml import etree
@@ -30,6 +37,14 @@ from pptx.dml.color import RGBColor
 from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.util import Pt
+
+__version__ = "1.2.0"
+
+# バージョン更新の確認先（GitHub の最新リリース）
+UPDATE_API_URL = "https://api.github.com/repos/Akatuki1121/ReSlide/releases/latest"
+UPDATE_RELEASES_URL = "https://github.com/Akatuki1121/ReSlide/releases"
+UPDATE_USER_AGENT = "ReSlide-UpdateChecker"
+UPDATE_TIMEOUT_SEC = 10
 
 EMU_PER_MM = 36000.0
 NS = {
@@ -2698,6 +2713,170 @@ def _apply_structure_repeat(slide, sno, elems, cfg, no, f, median):
     )
 
 
+# ---------------------------------------------------------------- バージョン更新の確認
+def _version_key(version):
+    """バージョン文字列を数値のタプルにする。解釈できなければ None。
+
+    先頭の v は外し、"1.10.0" と "1.9.0" を文字列ではなく数値で比べる。
+    桁数は3つにそろえる（"1.2" と "1.2.0" を同じとみなす）。
+    """
+    s = str(version).strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    if not re.search(r"\d", s):
+        return None
+    nums = []
+    for part in s.split("."):
+        m = re.match(r"\d+", part)
+        nums.append(int(m.group()) if m else 0)
+    return tuple((nums + [0, 0, 0])[:3])
+
+
+def is_dev_version(version):
+    """開発版かどうか（-dev を含む、または 0.0.0）。"""
+    return "-dev" in version or version.strip() == "0.0.0"
+
+
+def should_auto_check(version=None):
+    """GUI 起動時に自動で更新確認をするか。開発版ではしない。"""
+    return not is_dev_version(__version__ if version is None else version)
+
+
+def pick_release_asset(assets):
+    """リリースの asset 一覧から、配布用 zip のダウンロード URL を選ぶ。
+
+    名前が「ReSlide-」で始まり「.zip」で終わるもの。無ければ None。
+    """
+    for a in assets or []:
+        name = a.get("name") or ""
+        if name.startswith("ReSlide-") and name.endswith(".zip"):
+            return a.get("browser_download_url")
+    return None
+
+
+def interpret_update_response(data, current_version):
+    """GitHub API の応答（releases/latest の JSON）を、更新確認の結果に直す。
+
+    ネットワークには触らない。結果は status（update_available / up_to_date /
+    failed）、latest_tag、zip_url、html_url、current を持つ dict。
+    """
+    result = {
+        "status": "failed",
+        "latest_tag": None,
+        "zip_url": None,
+        "html_url": UPDATE_RELEASES_URL,
+        "current": current_version,
+    }
+    if not isinstance(data, dict):
+        return result
+    tag = data.get("tag_name")
+    latest_key = _version_key(tag) if tag else None
+    current_key = _version_key(current_version)
+    if latest_key is None or current_key is None:
+        return result
+    result["latest_tag"] = tag
+    if data.get("html_url"):
+        result["html_url"] = data["html_url"]
+    if latest_key > current_key:
+        result["status"] = "update_available"
+        result["zip_url"] = pick_release_asset(data.get("assets"))
+    else:
+        result["status"] = "up_to_date"
+    return result
+
+
+def check_update(current_version=None):
+    """GitHub の最新リリースを確認し、結果の dict を返す。
+
+    失敗しても例外は投げず、status="failed" で返す（オフラインでも
+    呼び出し側が止まらないように）。current_version はテスト用に差し替えられる。
+    """
+    current = __version__ if current_version is None else current_version
+    failed = {
+        "status": "failed",
+        "latest_tag": None,
+        "zip_url": None,
+        "html_url": UPDATE_RELEASES_URL,
+        "current": current,
+    }
+    req = urllib.request.Request(
+        UPDATE_API_URL,
+        headers={
+            "User-Agent": UPDATE_USER_AGENT,
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SEC) as res:
+            data = json.loads(res.read().decode("utf-8"))
+    except Exception:
+        return failed
+    return interpret_update_response(data, current)
+
+
+def format_update_check_line(result):
+    """--check-update の標準出力（1〜2行）を返す。"""
+    if result["status"] == "update_available":
+        return "新しいバージョン %s があります（現在のバージョン v%s）\nダウンロード: %s" % (
+            result["latest_tag"],
+            result["current"],
+            result["zip_url"] or result["html_url"],
+        )
+    if result["status"] == "up_to_date":
+        return "最新です（現在のバージョン v%s）" % result["current"]
+    return "更新の確認に失敗しました"
+
+
+def update_banner_info(result):
+    """更新確認の結果から、GUI のバナーに出す内容を決める。不要なら None。
+
+    zip の URL があればボタンを「ダウンロード」にし、無ければ
+    「Releasesを開く」にする。tkinter には触らない（テスト用に分けてある）。
+    """
+    if not result or result.get("status") != "update_available":
+        return None
+    zip_url = result.get("zip_url")
+    return {
+        "text": "新しいバージョン %s があります" % result.get("latest_tag"),
+        "latest_tag": result.get("latest_tag"),
+        "zip_url": zip_url,
+        "releases_url": result.get("html_url") or UPDATE_RELEASES_URL,
+        "download_label": "ダウンロード" if zip_url else "Releasesを開く",
+    }
+
+
+def download_update_zip(url, dest_dir=None, progress=None):
+    """更新の zip を一時フォルダへダウンロードし、保存先の Path を返す。
+
+    保存先は一時フォルダの下の ReSlideUpdate フォルダ（dest_dir で変更可）。
+    progress は 0〜100 の整数（全体サイズが分からない時は None）で呼ばれる。
+    差し替えはせず、保存までで止める（開く・入れ替えは利用者の手に委ねる）。
+    """
+    folder = (
+        Path(dest_dir)
+        if dest_dir
+        else Path(tempfile.gettempdir()) / "ReSlideUpdate"
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    name = url.split("/")[-1].split("?")[0] or "ReSlide-update.zip"
+    dest = folder / name
+    req = urllib.request.Request(url, headers={"User-Agent": UPDATE_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT_SEC) as res:
+        total = res.headers.get("Content-Length")
+        total = int(total) if total and total.isdigit() else None
+        done = 0
+        with open(dest, "wb") as f:
+            while True:
+                chunk = res.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    progress(int(done * 100 / total) if total else None)
+    return dest
+
+
 # ---------------------------------------------------------------- GUI（--gui）
 def build_structure_rows(structure_findings):
     """GUI の一覧に表示する行データを、レポートと同じ番号・順序で返す。
@@ -2779,6 +2958,7 @@ def run_gui(src, prs, slides, cfg, resolver):
     テストできる関数（build_structure_rows / apply_gui_selection）に分けてある。
     """
     import tkinter as tk
+    from tkinter import messagebox
 
     structure_findings = judge_structure(slides, cfg, prs.slide_width, prs.slide_height)
     rows = build_structure_rows(structure_findings)
@@ -2790,11 +2970,12 @@ def run_gui(src, prs, slides, cfg, resolver):
     tk.Label(root, text="対象ファイル: %s" % src.name, anchor="w").pack(
         fill="x", padx=10, pady=(10, 2)
     )
-    tk.Label(
+    count_label = tk.Label(
         root,
         text="構成の指摘 %d件。直したいものにチェックを入れてください。" % len(rows),
         anchor="w",
-    ).pack(fill="x", padx=10, pady=(0, 6))
+    )
+    count_label.pack(fill="x", padx=10, pady=(0, 6))
 
     outer = tk.Frame(root)
     outer.pack(fill="both", expand=True, padx=10)
@@ -2895,7 +3076,115 @@ def run_gui(src, prs, slides, cfg, resolver):
         buttons, text="選択した指摘を修正して保存", command=on_apply
     )
     apply_button.pack(side="left")
-    tk.Button(buttons, text="閉じる", command=root.destroy).pack(side="left", padx=8)
+    close_button = tk.Button(buttons, text="閉じる", command=root.destroy)
+    close_button.pack(side="left", padx=8)
+
+    # --- バージョン更新の確認（起動時は裏で確認し、あれば上部にバナーを出す）
+    update_state = {"running": False}
+    banner = tk.Frame(root, bg="#fdf3d8")
+    banner_label = tk.Label(banner, text="", bg="#fdf3d8", anchor="w")
+    banner_label.pack(side="left", padx=(8, 4), pady=4)
+    download_button = tk.Button(banner, text="ダウンロード")
+    download_button.pack(side="left", padx=2, pady=4)
+    tk.Button(banner, text="後で", command=banner.pack_forget).pack(
+        side="left", padx=2, pady=4
+    )
+
+    def open_saved_folder(folder):
+        if hasattr(os, "startfile"):
+            os.startfile(str(folder))  # Windows のエクスプローラーで開く
+        else:
+            messagebox.showinfo("更新のダウンロード", "保存先: %s" % folder)
+
+    def on_download(info):
+        download_button.configure(state="disabled", text="ダウンロード中… 0%")
+
+        def on_progress(pct):
+            if pct is None:
+                download_button.configure(text="ダウンロード中…")
+            else:
+                download_button.configure(text="ダウンロード中… %d%%" % pct)
+
+        def on_done(saved):
+            download_button.configure(
+                state="normal",
+                text="保存先フォルダを開く",
+                command=lambda: open_saved_folder(saved.parent),
+            )
+            show_result("新しいバージョンの zip を保存しました: %s" % saved)
+
+        def on_failed():
+            download_button.configure(
+                state="normal",
+                text="ダウンロード",
+                command=lambda: on_download(info),
+            )
+            messagebox.showerror("更新のダウンロード", "ダウンロードに失敗しました")
+
+        def work():
+            try:
+                saved = download_update_zip(
+                    info["zip_url"],
+                    progress=lambda pct: root.after(0, on_progress, pct),
+                )
+            except Exception:
+                root.after(0, on_failed)
+                return
+            root.after(0, on_done, saved)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_update_banner(result):
+        info = update_banner_info(result)
+        if info is None:
+            return
+        banner_label.configure(text=info["text"])
+        if info["zip_url"]:
+            download_button.configure(
+                state="normal",
+                text="ダウンロード",
+                command=lambda: on_download(info),
+            )
+        else:
+            download_button.configure(
+                state="normal",
+                text="Releasesを開く",
+                command=lambda: webbrowser.open(info["releases_url"]),
+            )
+        if not banner.winfo_ismapped():
+            banner.pack(fill="x", padx=10, pady=(0, 6), before=count_label)
+
+    def on_check_done(result, manual):
+        update_state["running"] = False
+        if result["status"] == "update_available":
+            show_update_banner(result)
+        elif manual:
+            if result["status"] == "up_to_date":
+                messagebox.showinfo(
+                    "更新の確認", "最新です（現在のバージョン v%s）" % __version__
+                )
+            else:
+                messagebox.showwarning("更新の確認", "確認に失敗しました")
+
+    def start_update_check(manual):
+        if update_state["running"]:
+            if manual:
+                messagebox.showinfo("更新の確認", "すでに確認中です")
+            return
+        update_state["running"] = True
+
+        def work():
+            result = check_update()
+            root.after(0, on_check_done, result, manual)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    tk.Button(
+        buttons, text="更新を確認", command=lambda: start_update_check(True)
+    ).pack(side="left", padx=8, before=close_button)
+
+    if should_auto_check(__version__):
+        start_update_check(False)
 
     root.mainloop()
     return 0
@@ -3154,12 +3443,23 @@ def main(argv=None):
         action="store_true",
         help="構成の指摘を一覧で見て選んで修正するウィンドウを開く",
     )
+    ap.add_argument(
+        "--check-update",
+        action="store_true",
+        help="新しいバージョンがあるかだけを確認して終わる（レポートは作らない）",
+    )
+    ap.add_argument(
+        "--version", action="version", version="ReSlide %s" % __version__
+    )
     args = ap.parse_args(argv)
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8")
         except Exception:
             pass
+    if args.check_update:
+        print(format_update_check_line(check_update()))
+        return 0
     structure_nums = None
     if args.structure_apply is not None:
         try:
