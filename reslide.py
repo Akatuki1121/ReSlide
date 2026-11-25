@@ -38,7 +38,7 @@ from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.util import Pt
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # バージョン更新の確認先（GitHub の最新リリース）
 UPDATE_API_URL = "https://api.github.com/repos/Akatuki1121/ReSlide/releases/latest"

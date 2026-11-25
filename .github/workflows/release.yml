@@ -1,9 +1,11 @@
 name: Release
 
 # タグ（v*）の push で Windows 用 exe を PyInstaller でビルドし、
-# ReSlide.exe / ReSlide.bat / reslide_config.json / 使い方.txt を zip にして
-# Release に添付する。手動実行（workflow_dispatch）ではビルドと動作確認だけ
-# 行い、zip を artifact として残す（Release は作らない）。
+# ReSlide フォルダ（本体一式）/ ReSlide.bat / reslide_config.json / 使い方.txt
+# を zip にして Release に添付する。手動実行（workflow_dispatch）では
+# ビルドと動作確認だけ行い、zip を artifact として残す（Release は作らない）。
+# 配布はフォルダ形（onedir）。onefile だと起動のたびに全体を一時フォルダへ
+# 展開する待ちが生じるため、展開済みの形で配る。
 
 on:
   push:
@@ -36,14 +38,14 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe with PyInstaller
-        run: pyinstaller --onefile --name ReSlide --add-data "reslide_config.json;." reslide.py
+        run: pyinstaller --onedir --name ReSlide --add-data "reslide_config.json;." reslide.py
 
       - name: Smoke test the frozen exe
         shell: pwsh
         run: |
-          .\dist\ReSlide.exe --help
+          .\dist\ReSlide\ReSlide.exe --help
           python -c "from pptx import Presentation; from pptx.util import Pt; prs = Presentation(); slide = prs.slides.add_slide(prs.slide_layouts[6]); tb = slide.shapes.add_textbox(100000, 100000, 4000000, 1000000); tf = tb.text_frame; tf.text = 'テスト'; tf.paragraphs[0].runs[0].font.size = Pt(10); prs.save('smoke.pptx')"
-          .\dist\ReSlide.exe --fix smoke.pptx
+          .\dist\ReSlide\ReSlide.exe --fix smoke.pptx
           if (-not (Test-Path smoke_reslide.pptx)) { throw 'smoke test failed: smoke_reslide.pptx was not created' }
           if (-not (Test-Path smoke_reslide_changes.md)) { throw 'smoke test failed: smoke_reslide_changes.md was not created' }
           Write-Host 'smoke test passed'
@@ -55,7 +57,8 @@ jobs:
           if ($env:GITHUB_REF_TYPE -eq 'tag') { $version = $env:GITHUB_REF_NAME } else { $version = 'dev' }
           "zip_name=ReSlide-$version.zip" >> $env:GITHUB_OUTPUT
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item dist\ReSlide.exe, ReSlide.bat, reslide_config.json, 使い方.txt release\
+          Copy-Item dist\ReSlide release\ -Recurse
+          Copy-Item ReSlide.bat, reslide_config.json, 使い方.txt release\
           Compress-Archive -Path release\* -DestinationPath "ReSlide-$version.zip"
           Get-ChildItem "ReSlide-$version.zip"
 
@@ -86,4 +89,4 @@ jobs:
         run: |
           gh release create "$TAG" "dist/ReSlide-$TAG.zip" \
             --title "ReSlide $TAG" \
-            --notes "ReSlide.exe（本体）/ ReSlide.bat（ドラッグ＆ドロップ用）/ reslide_config.json（判定の基準値の設定）/ 使い方.txt を同梱しています。zip を展開し、ReSlide.bat に .pptx をドラッグ＆ドロップしてください。exe は無署名です。Windows の SmartScreen で警告が出た時は、「詳細情報」を選んでから「実行」を押してください。"
+            --notes "ReSlide フォルダ（本体一式）/ ReSlide.bat（ドラッグ＆ドロップ用）/ reslide_config.json（判定の基準値の設定）/ 使い方.txt を同梱しています。zip を展開し、ReSlide.bat に .pptx をドラッグ＆ドロップしてください。更新の時は、ReSlide フォルダごと新しいものに差し替えてください。exe は無署名です。Windows の SmartScreen で警告が出た時は、「詳細情報」を選んでから「実行」を押してください。"
